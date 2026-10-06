@@ -1,0 +1,11 @@
+[package]
+name = "change-signals"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[[bin]]
+name = "chsig"
+path = "src/main.rs"
+
+[dependencies]

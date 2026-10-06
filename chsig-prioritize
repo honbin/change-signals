@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# chsig-prioritize — the "prioritize" stage of signals -> prioritize -> interrogate.
+#
+# Pipes chsig's factual signals to `claude -p` so it names the 3-5 symbols to read first,
+# with signal-grounded reasons. Deliberately a thin shell layer, NOT Rust: the LLM call is
+# non-deterministic I/O and stays OUTSIDE the deterministic chsig core. I/O and judgment
+# live in this shell seam; computation stays in the binary. chsig emits facts; this turns
+# them into a reading order. The two never mix — no judgment leaks back into the extractor.
+#
+# Usage: chsig-prioritize [git diff args]   e.g. chsig-prioritize main...HEAD
+set -euo pipefail
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Prefer a locally built binary; fall back to one on PATH.
+chsig=""
+for cand in "$here/target/release/chsig" "$here/target/debug/chsig"; do
+  if [ -x "$cand" ]; then chsig="$cand"; break; fi
+done
+[ -n "$chsig" ] || chsig="$(command -v chsig || true)"
+[ -n "$chsig" ] || { echo "chsig-prioritize: chsig binary not found (build it first)" >&2; exit 1; }
+command -v claude >/dev/null 2>&1 || { echo "chsig-prioritize: claude CLI not found" >&2; exit 1; }
+
+# chsig runs in the caller's repo (its own cwd), not this script's dir.
+signals="$("$chsig" "$@")"
+if [ -z "${signals//[[:space:]]/}" ]; then
+  echo "chsig-prioritize: no signals (empty diff?)" >&2
+  exit 0
+fi
+
+prompt=$(cat <<'PROMPT'
+You are given `change-signals` output: per changed symbol, coarse factual signals from a
+git diff. You see only these signals — not the code or the diff.
+Signal meanings (all facts, deliberately crude):
+- refs=N   : lines across the repo matching the symbol name (git grep -w). NOT resolved
+             references — strings/comments count, and short/common names (index, query, e)
+             inflate. A high number alone is weak evidence.
+- branch±N : net change in branch tokens (if/else/match/&&/||/?.) within the diff.
+- db|cache|net : the change touches a line mentioning that boundary (a marker, not a score).
+
+Task: choose the 3-5 symbols that appear most useful to READ FIRST when investigating
+this change.
+- Use the signals as evidence, not as a scoring formula. Consider which symbols are most
+  likely to explain the shape and consequences of the change. Multiple signals may
+  strengthen a case, but no individual signal implies risk. Discount refs when the name
+  is short or generic.
+- For each pick: `symbol` — one line citing the specific signals that justify it.
+- Do NOT claim the rest are "safe to skip": you are choosing a reading order, not issuing
+  a verdict. Unlisted symbols are simply lower priority, not cleared.
+- End with one line naming which pick to run `interrogate` on first.
+Output only the list and that final line. No preamble.
+PROMPT
+)
+
+printf '%s' "$signals" | claude -p "$prompt"
