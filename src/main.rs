@@ -44,6 +44,7 @@ fn main() {
     };
 
     // Args pass straight to `git diff` (e.g. `chsig main...HEAD`); none = working diff.
+    let side = source_side(&args);
     let diff = git_diff(&args);
     if diff.trim().is_empty() {
         eprintln!("chsig: no diff");
@@ -52,7 +53,7 @@ fn main() {
 
     let files = parse_diff(&diff);
     for file in &files {
-        let symbols = collect_symbols(&root, file);
+        let symbols = collect_symbols(&root, file, side);
         if symbols.is_empty() {
             continue;
         }
@@ -92,29 +93,42 @@ fn git_diff(args: &[String]) -> String {
     String::from_utf8_lossy(&out.stdout).to_string()
 }
 
-/// How many lines across tracked files `name` matches (word boundary, fixed string).
-/// Not resolved references — just matching lines, a crude fact. Counts strings and
-/// comments too; that noise is left visible rather than hidden.
-fn ref_line_count(name: &str) -> usize {
+/// Count lines matching `name` across the **tracked files in the current working tree** —
+/// not the diff's revision, so with a commit range refs is a present-day figure while the
+/// changed symbols come from the range (git grep's default omits untracked files). Not
+/// resolved references, just matching lines (a crude fact that counts strings and comments
+/// too), left visible rather than hidden.
+///
+/// `None` = could not be measured (git grep failed, or its output didn't parse), kept
+/// distinct from a measured zero so a non-fact is never reported as `refs=0`.
+fn ref_line_count(name: &str) -> Option<usize> {
     let out = Command::new("git")
         .args(["grep", "-Fw", "-c", "--", name])
-        .output();
-    let Ok(out) = out else { return 0 };
-    // Output is `path:count` lines; sum the counts.
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(|line| line.rsplit_once(':'))
-        .filter_map(|(_, n)| n.trim().parse::<usize>().ok())
-        .sum()
+        .output()
+        .ok()?;
+    // git grep exits 0 (matches) or 1 (no matches) — both real measurements; >=2 is an error.
+    if !matches!(out.status.code(), Some(0) | Some(1)) {
+        return None;
+    }
+    // Output is `path:count` lines; sum the counts. Any line that doesn't parse -> None, so
+    // a garbled result becomes refs=? rather than a silently-low number.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut total = 0usize;
+    for line in stdout.lines() {
+        let (_, count) = line.rsplit_once(':')?;
+        total = total.checked_add(count.trim().parse::<usize>().ok()?)?;
+    }
+    Some(total)
 }
 
 // ---- diff parsing ----------------------------------------------------------
 
 struct ChangedFile {
     path: String,
-    /// Blob SHA of the new side, from the `index old..new` header. The source must be read
-    /// from here (not the working tree) so line numbers match the diff for `--cached` and
-    /// commit-range comparisons. `None` for a working-tree diff (new side isn't a blob).
+    /// New-side blob SHA from the `index old..new` header (all-zeros filtered to `None`).
+    /// Used only when the new side is read as a `Blob` (`--cached`, ranges). A plain working
+    /// diff also carries a non-zero SHA here, but it names unstaged content that isn't a
+    /// stored object, so it is ignored and that side is read from the working file instead.
     new_blob: Option<String>,
     /// Changed lines as (new-side line, sign, body-without-+/-). Sign is +1 for additions,
     /// -1 for removals, so a removed branch token subtracts rather than adds.
@@ -202,14 +216,19 @@ struct SymbolSignals {
 
 #[derive(Default)]
 struct Signals {
-    refs: usize,
+    /// `None` = refs could not be measured (shown as `refs=?`), distinct from `Some(0)`.
+    refs: Option<usize>,
     branch_delta: i32,
     boundaries: Vec<&'static str>,
 }
 
 impl Signals {
     fn render(&self) -> String {
-        let mut parts = vec![format!("refs={}", self.refs)];
+        let refs = match self.refs {
+            Some(n) => format!("refs={n}"),
+            None => "refs=?".to_string(),
+        };
+        let mut parts = vec![refs];
         if self.branch_delta != 0 {
             let sign = if self.branch_delta > 0 { "+" } else { "" };
             parts.push(format!("branch{}{}", sign, self.branch_delta));
@@ -224,9 +243,9 @@ impl Signals {
 /// Read the new-side source and attribute its changed lines to the enclosing symbols, then
 /// attach `refs`. The attribution itself is pure (`attribute_signals`); only the source read
 /// and the git-backed `refs` live here.
-fn collect_symbols(root: &str, file: &ChangedFile) -> Vec<SymbolSignals> {
-    let Some(source) = read_new_side(root, file) else {
-        return Vec::new(); // deleted, binary, unreadable
+fn collect_symbols(root: &str, file: &ChangedFile, side: SourceSide) -> Vec<SymbolSignals> {
+    let Some(source) = read_new_side(root, file, side) else {
+        return Vec::new(); // deleted, binary, unreadable, or new side absent in the chosen source
     };
     attribute_signals(&source, &file.path, file)
         .into_iter()
@@ -244,20 +263,63 @@ fn collect_symbols(root: &str, file: &ChangedFile) -> Vec<SymbolSignals> {
         .collect()
 }
 
-/// Source of the new side of the diff. Prefer the exact blob (`git cat-file`) so line
-/// numbers match the diff under `--cached` and commit ranges; fall back to the working tree
-/// for a plain `git diff`, where the new side is the working file rather than a stored blob.
-fn read_new_side(root: &str, file: &ChangedFile) -> Option<String> {
-    if let Some(blob) = &file.new_blob {
-        let out = Command::new("git")
-            .args(["cat-file", "-p", blob])
-            .output()
-            .ok()?;
-        if out.status.success() {
-            return Some(String::from_utf8_lossy(&out.stdout).into_owned());
+/// Where the new side of the diff lives, decided once from the invocation. The two are never
+/// mixed: reading the wrong source attributes changes against content whose line numbers
+/// don't match the diff.
+#[derive(Clone, Copy)]
+enum SourceSide {
+    /// Plain `git diff`, `git diff <rev>`, path-limited diff: the new side is the working file.
+    Worktree,
+    /// `--cached`/`--staged`, a `..`/`...` range, or two revisions: the new side is a stored blob.
+    Blob,
+}
+
+/// Classify the supported git diff forms (the test fixes the exact contract).
+/// Pathspecs should follow `--` to avoid ambiguity.
+/// This is not a general-purpose git argument parser.
+fn source_side(args: &[String]) -> SourceSide {
+    let mut revs = 0;
+    for a in args {
+        if a == "--" {
+            break; // pathspecs follow; they don't change the side
+        }
+        if a == "--cached" || a == "--staged" || a.contains("..") {
+            return SourceSide::Blob;
+        }
+        if !a.starts_with('-') {
+            revs += 1;
         }
     }
-    std::fs::read_to_string(format!("{root}/{}", file.path)).ok()
+    if revs >= 2 {
+        SourceSide::Blob
+    } else {
+        SourceSide::Worktree
+    }
+}
+
+/// Read the new side from the chosen source — no fallback between them. On failure the file
+/// is skipped: a missing fact beats a plausible one read from the wrong source.
+fn read_new_side(root: &str, file: &ChangedFile, side: SourceSide) -> Option<String> {
+    match side {
+        SourceSide::Worktree => std::fs::read_to_string(format!("{root}/{}", file.path)).ok(),
+        SourceSide::Blob => {
+            let blob = file.new_blob.as_ref()?; // no new side (e.g. deletion): expected skip
+            let read = Command::new("git")
+                .args(["cat-file", "-p", blob])
+                .output()
+                .ok()
+                .filter(|out| out.status.success())
+                .map(|out| String::from_utf8_lossy(&out.stdout).into_owned());
+            if read.is_none() {
+                // Reading the blob failed though one was named — surface the skip, don't hide it.
+                eprintln!(
+                    "chsig: could not read new-side blob {blob} for {}; skipping",
+                    file.path
+                );
+            }
+            read
+        }
+    }
 }
 
 /// Attribute changed lines to enclosing symbols, in first-seen order. Pure (no git, no disk)
@@ -477,6 +539,17 @@ mod tests {
     // over-captures — so later tuning (v2) can't silently drift. I/O fns (git_*,
     // ref_line_count, collect_symbols) are left to integration; not exercised here.
 
+    #[test]
+    fn source_side_classifies_supported_forms() {
+        let s = |a: &[&str]| source_side(&a.iter().map(|x| x.to_string()).collect::<Vec<_>>());
+        assert!(matches!(s(&[]), SourceSide::Worktree)); // plain working diff
+        assert!(matches!(s(&["HEAD"]), SourceSide::Worktree)); // `git diff HEAD` = tree vs HEAD
+        assert!(matches!(s(&["--cached"]), SourceSide::Blob));
+        assert!(matches!(s(&["main...HEAD"]), SourceSide::Blob));
+        assert!(matches!(s(&["HEAD~1", "HEAD"]), SourceSide::Blob));
+        assert!(matches!(s(&["--", "src/foo.ts"]), SourceSide::Worktree)); // pathspec, not a rev
+    }
+
     fn names(path: &str, src: &str) -> Vec<String> {
         find_symbol_defs(path, src)
             .into_iter()
@@ -645,22 +718,28 @@ index abc1234..def5678 100644
     #[test]
     fn render_joins_present_signals_only() {
         let bare = Signals {
-            refs: 3,
+            refs: Some(3),
             branch_delta: 0,
             boundaries: vec![],
         };
         assert_eq!(bare.render(), "refs=3");
         let full = Signals {
-            refs: 3,
+            refs: Some(3),
             branch_delta: 2,
             boundaries: vec!["cache"],
         };
         assert_eq!(full.render(), "refs=3, branch+2, cache");
         let neg = Signals {
-            refs: 1,
+            refs: Some(1),
             branch_delta: -1,
             boundaries: vec![],
         };
         assert_eq!(neg.render(), "refs=1, branch-1");
+        let unmeasured = Signals {
+            refs: None,
+            branch_delta: 0,
+            boundaries: vec![],
+        };
+        assert_eq!(unmeasured.render(), "refs=?");
     }
 }
