@@ -7,6 +7,7 @@
 //! in diff order. Ranking is `prioritize` (v2 / LLM); drilling is `interrogate` (v3).
 
 use std::collections::BTreeMap;
+use std::io::{self, Write};
 use std::process::Command;
 
 // ---- tunables tied to the target codebase ----------------------------------
@@ -52,17 +53,42 @@ fn main() {
     }
 
     let files = parse_diff(&diff);
+    // Handle write errors explicitly: BrokenPipe is expected when the reader exits early.
+    let mut out = io::stdout().lock();
     for file in &files {
         let symbols = collect_symbols(&root, file, side);
         if symbols.is_empty() {
             continue;
         }
-        println!("{}", file.path);
-        for sym in &symbols {
-            println!("  {:<28} {}", sym.name, sym.signals.render());
+        if let Err(e) = write_file_signals(&mut out, file, &symbols) {
+            exit_on_write_error(e);
         }
-        println!();
     }
+    if let Err(e) = out.flush() {
+        exit_on_write_error(e);
+    }
+}
+
+fn write_file_signals(
+    out: &mut impl Write,
+    file: &ChangedFile,
+    symbols: &[SymbolSignals],
+) -> io::Result<()> {
+    writeln!(out, "{}", file.path)?;
+    for sym in symbols {
+        writeln!(out, "  {:<28} {}", sym.name, sym.signals.render())?;
+    }
+    writeln!(out)
+}
+
+/// BrokenPipe means the reader went away (`chsig | head`) — exit quietly. Any other write error
+/// (disk full, etc.) is real: report it and fail, never swallow it into a success.
+fn exit_on_write_error(e: io::Error) -> ! {
+    if e.kind() == io::ErrorKind::BrokenPipe {
+        std::process::exit(0);
+    }
+    eprintln!("chsig: error writing output: {e}");
+    std::process::exit(1);
 }
 
 // ---- git -------------------------------------------------------------------
