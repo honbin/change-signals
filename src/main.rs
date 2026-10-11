@@ -4,7 +4,8 @@
 //! First stage of `signals -> prioritize -> interrogate`. Its one job: gather facts,
 //! not judgments. `refs=1` is a fact; "safe to skip" is a judgment — this stage never
 //! crosses that line (no skip verdict). So it does not rank by risk; it prints per file
-//! in diff order. Ranking is `prioritize` (v2 / LLM); drilling is `interrogate` (v3).
+//! in diff order. Ranking is the `prioritize` stage (LLM); drilling is `interrogate` — both
+//! downstream of this tool.
 
 use std::collections::BTreeMap;
 use std::io::{self, Write};
@@ -562,7 +563,7 @@ mod tests {
     use super::*;
 
     // Tests pin *current* heuristic behavior as a regression anchor — including known
-    // over-captures — so later tuning (v2) can't silently drift. I/O fns (git_*,
+    // over-captures — so later tuning can't silently drift. I/O fns (git_*,
     // ref_line_count, collect_symbols) are left to integration; not exercised here.
 
     #[test]
