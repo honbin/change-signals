@@ -631,6 +631,61 @@ fn foo() {
         assert_eq!(out, vec![("foo".to_string(), 0, vec![])]);
     }
 
+    // KNOWN DEFECT, pinned as current behavior — not endorsed. `brace_delta` counts a `}` inside a
+    // string literal, so the `}` on line 2 closes `alpha` early; the real change on line 3 then
+    // falls outside every def and is dropped silently instead of pointing at alpha. A fix should
+    // flip this to `[("alpha", 1, [])]`.
+    #[test]
+    fn stray_brace_in_string_closes_symbol_early_and_drops_change() {
+        let source = "\
+fn alpha() {
+    let s = \"}\";
+    if p && q {}
+}
+fn beta() {
+    let x = 1;
+}
+";
+        // Span check documents the early close: alpha's body is truncated at line 2.
+        let defs = find_symbol_defs("a.rs", source);
+        let alpha = defs.iter().find(|d| d.name == "alpha").unwrap();
+        assert_eq!((alpha.start, alpha.end), (1, 2)); // true body is lines 1..=4
+
+        // The real change on line 3 is inside alpha's *true* body but outside the truncated span.
+        let file = ChangedFile {
+            path: "a.rs".into(),
+            new_blob: None,
+            changed_bodies: vec![(3, 1, "    if p && q {}".into())],
+        };
+        let out = attribute_signals(source, "a.rs", &file);
+        assert!(out.is_empty()); // DEFECT: silently dropped; should be [("alpha", 1, [])]
+    }
+
+    // KNOWN DEFECT, pinned as current behavior — not endorsed. A symbol deleted above `bar` has no
+    // new-side line, so its removed lines attribute to the next new-side line — inside the
+    // *unchanged* `bar`, which then shows a false `branch-1` while the deleted symbol shows nothing.
+    #[test]
+    fn pure_deletion_bleeds_onto_unchanged_following_symbol() {
+        // New side: `fn foo` (which had `if y`) has been deleted; `bar` is untouched.
+        let source = "\
+fn bar() {
+    let x = 1;
+}
+";
+        // The three removed lines of `foo` all attribute to new_line 1 (start of `bar`).
+        let file = ChangedFile {
+            path: "b.rs".into(),
+            new_blob: None,
+            changed_bodies: vec![
+                (1, -1, "fn foo() {".into()),
+                (1, -1, "    if y {}".into()),
+                (1, -1, "}".into()),
+            ],
+        };
+        let out = attribute_signals(source, "b.rs", &file);
+        assert_eq!(out, vec![("bar".to_string(), -1, vec![])]); // DEFECT: bar was not changed
+    }
+
     #[test]
     fn brace_depth_drops_deeper_locals_keeps_hook_level() {
         // Depth 0 (top level) and 1 (hook-level binding) are symbols; depth 2+ is not.
