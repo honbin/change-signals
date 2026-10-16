@@ -68,11 +68,9 @@ compute`). No judgment leaks back into the extractor. Requires `claude` on `PATH
 
 ### 3. interrogate
 
-Read the selected code and challenge it: verify assumptions, consider alternatives, and
-look for failure conditions. This can be done manually or with an interactive coding agent.
-
-This stage is deliberately outside chsig. The tool only helps decide where to look;
-understanding and judgment stay with the reader.
+Read the selected code and challenge it: verify assumptions, consider alternatives, look
+for failure conditions — by hand or with a coding agent. Deliberately outside chsig: the
+tool picks where to look, not what to conclude.
 
 ## Limitations
 
