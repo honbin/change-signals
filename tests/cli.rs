@@ -5,8 +5,15 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+// The developer's global/system git config must not leak into what these tests observe;
+// config under test is set per repo instead.
+fn isolated(cmd: &mut Command) -> &mut Command {
+    cmd.env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+}
+
 fn git(dir: &Path, args: &[&str]) {
-    let out = Command::new("git")
+    let out = isolated(&mut Command::new("git"))
         .args(args)
         .current_dir(dir)
         .output()
@@ -18,13 +25,20 @@ fn git(dir: &Path, args: &[&str]) {
     );
 }
 
-fn chsig(dir: &Path, args: &[&str]) -> String {
-    let out = Command::new(env!("CARGO_BIN_EXE_chsig"))
+fn chsig_full(dir: &Path, args: &[&str]) -> (String, String) {
+    let out = isolated(&mut Command::new(env!("CARGO_BIN_EXE_chsig")))
         .args(args)
         .current_dir(dir)
         .output()
         .expect("spawn chsig");
-    String::from_utf8_lossy(&out.stdout).into_owned()
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+fn chsig(dir: &Path, args: &[&str]) -> String {
+    chsig_full(dir, args).0
 }
 
 fn temp_repo(tag: &str) -> PathBuf {
@@ -35,6 +49,23 @@ fn temp_repo(tag: &str) -> PathBuf {
     git(&dir, &["config", "user.email", "t@t.test"]);
     git(&dir, &["config", "user.name", "t"]);
     git(&dir, &["config", "commit.gpgsign", "false"]);
+    dir
+}
+
+const ALPHA_BETA: &str = "fn alpha() {\n    let x = 1;\n}\nfn beta() {\n    let y = 2;\n}\n";
+// ALPHA_BETA with a branch added inside `alpha`.
+const ALPHA_CHANGED: &str =
+    "fn alpha() {\n    let x = 1;\n    if x > 0 {}\n}\nfn beta() {\n    let y = 2;\n}\n";
+
+/// Repo with `rel` committed as ALPHA_BETA, then edited (unstaged) to ALPHA_CHANGED.
+fn repo_with_alpha_edit(tag: &str, rel: &str) -> PathBuf {
+    let dir = temp_repo(tag);
+    let path = dir.join(rel);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, ALPHA_BETA).unwrap();
+    git(&dir, &["add", "-A"]);
+    git(&dir, &["commit", "-qm", "init"]);
+    std::fs::write(&path, ALPHA_CHANGED).unwrap();
     dir
 }
 
@@ -81,5 +112,96 @@ fn cached_diff_attributes_against_the_staged_blob_not_the_worktree() {
         "expected gamma (staged side) in:\n{out}"
     );
 
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// Each of these user settings changes `git diff` output shape; before chsig pinned its own
+// flags, every one of them made it print nothing and exit 0.
+#[test]
+fn user_diff_config_does_not_change_the_result() {
+    for (i, (key, val)) in [
+        ("diff.mnemonicPrefix", "true"),
+        ("diff.noprefix", "true"),
+        ("color.ui", "always"),
+        ("diff.relative", "true"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let dir = repo_with_alpha_edit(&format!("cfg{i}"), "sub/a.rs");
+        git(&dir, &["config", key, val]);
+        // From a subdirectory so diff.relative actually has something to relativize.
+        let out = chsig(&dir.join("sub"), &[]);
+        assert!(
+            out.contains("sub/a.rs") && out.contains("alpha"),
+            "with {key}={val}, expected sub/a.rs / alpha in:\n{out}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// A space makes git append a tab to the `+++` header; non-ASCII is octal-quoted by default.
+// Both used to make the file vanish from the output.
+#[test]
+fn paths_with_space_and_non_ascii_are_read() {
+    for (tag, rel) in [("space", "sp ace.rs"), ("nonascii", "日本/j.rs")] {
+        let dir = repo_with_alpha_edit(tag, rel);
+        let out = chsig(&dir, &[]);
+        assert!(
+            out.contains(rel) && out.contains("alpha"),
+            "expected {rel} / alpha in:\n{out}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// Paths git still C-quotes (here: a `"` in the name) are not parsed; the skip must be visible.
+#[test]
+fn quoted_path_skip_is_reported() {
+    let dir = repo_with_alpha_edit("quoted", "q\"x.rs");
+    let (_, err) = chsig_full(&dir, &[]);
+    assert!(
+        err.contains("skipping quoted path"),
+        "expected a skip notice on stderr, got:\n{err}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// refs counts the whole repo, not just below the invocation directory.
+#[test]
+fn refs_are_repo_wide_from_a_subdirectory() {
+    let dir = repo_with_alpha_edit("subdir", "a.rs");
+    std::fs::create_dir_all(dir.join("sub")).unwrap();
+    std::fs::write(dir.join("sub/u.rs"), "fn other() {}\n").unwrap();
+    git(&dir, &["add", "sub/u.rs"]);
+
+    let at_root = chsig(&dir, &[]);
+    let in_sub = chsig(&dir.join("sub"), &[]);
+    assert!(at_root.contains("refs=1"), "expected refs=1 in:\n{at_root}");
+    assert_eq!(in_sub, at_root);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// `<rev>^!` is a range (commit vs parent): the new side is the commit's blob. Reading the
+// worktree — here shifted by three lines — attributed the change to the wrong symbol.
+#[test]
+fn caret_bang_range_reads_the_commit_not_the_worktree() {
+    let dir = temp_repo("caretbang");
+    std::fs::write(dir.join("a.rs"), ALPHA_BETA).unwrap();
+    git(&dir, &["add", "a.rs"]);
+    git(&dir, &["commit", "-qm", "init"]);
+    let beta_changed =
+        "fn alpha() {\n    let x = 1;\n}\nfn beta() {\n    let y = 2;\n    if y > 0 {}\n}\n";
+    std::fs::write(dir.join("a.rs"), beta_changed).unwrap();
+    git(&dir, &["commit", "-qam", "beta"]);
+    std::fs::write(
+        dir.join("a.rs"),
+        format!("// 1\n// 2\n// 3\n{beta_changed}"),
+    )
+    .unwrap();
+
+    let out = chsig(&dir, &["HEAD^!"]);
+    assert!(out.contains("beta"), "expected beta in:\n{out}");
+    assert!(!out.contains("alpha"), "alpha was not changed:\n{out}");
     let _ = std::fs::remove_dir_all(&dir);
 }

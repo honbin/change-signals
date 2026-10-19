@@ -75,7 +75,11 @@ tool picks where to look, not what to conclude.
 ## Limitations
 
 - Heuristic symbol detection for Rust and TypeScript/JavaScript only; other files are skipped.
-- `refs` is `git grep`-based, not resolved references.
+- Changes outside a recognized definition are not shown. Unrecognized forms include TS class
+  methods (`foo() {`), Rust `pub(super) fn` / `extern "C" fn`, and Rust fns nested deeper than
+  `MAX_DEF_DEPTH` (e.g. `impl` inside `mod`).
+- `refs` is `git grep`-based (tracked files across the whole repo, as in the working tree),
+  not resolved references.
 - `branch` and the boundary tags (`db`/`cache`/`net`) are crude substring markers, not
   semantic analysis.
 - Nested / multi-line constructs may attribute coarsely to the parent symbol.

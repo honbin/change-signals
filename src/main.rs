@@ -106,8 +106,18 @@ fn git_root() -> Option<String> {
 }
 
 fn git_diff(args: &[String]) -> String {
+    // Pin the output shape parse_diff relies on against user config (color, mnemonic or no
+    // prefix, external diff, relative paths, quoted non-ASCII paths). User args come after,
+    // so an explicit flag still wins.
     let out = Command::new("git")
-        .arg("diff")
+        .args(["-c", "core.quotePath=false", "diff"])
+        .args([
+            "--no-color",
+            "--no-ext-diff",
+            "--no-relative",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
+        ])
         .args(args)
         .output()
         .expect("failed to run git diff");
@@ -120,7 +130,7 @@ fn git_diff(args: &[String]) -> String {
     String::from_utf8_lossy(&out.stdout).to_string()
 }
 
-/// Count lines matching `name` across the **tracked files in the current working tree** —
+/// Count lines matching `name` across the repo's **tracked files in the current working tree** —
 /// not the diff's revision, so with a commit range refs is a present-day figure while the
 /// changed symbols come from the range (git grep's default omits untracked files). Not
 /// resolved references, just matching lines (a crude fact that counts strings and comments
@@ -128,9 +138,12 @@ fn git_diff(args: &[String]) -> String {
 ///
 /// `None` = could not be measured (git grep failed, or its output didn't parse), kept
 /// distinct from a measured zero so a non-fact is never reported as `refs=0`.
-fn ref_line_count(name: &str) -> Option<usize> {
+fn ref_line_count(root: &str, name: &str) -> Option<usize> {
+    // git grep searches only below cwd; run from the root so a subdirectory invocation
+    // doesn't report a low count as if it were the whole repo.
     let out = Command::new("git")
-        .args(["grep", "-Fw", "-c", "--", name])
+        .args(["grep", "--no-color", "-Fw", "-c", "--", name])
+        .current_dir(root)
         .output()
         .ok()?;
     // git grep exits 0 (matches) or 1 (no matches) — both real measurements; >=2 is an error.
@@ -167,8 +180,48 @@ fn parse_diff(diff: &str) -> Vec<ChangedFile> {
     let mut current: Option<ChangedFile> = None;
     let mut pending_blob: Option<String> = None; // new-side SHA seen before the `+++ b/` line
     let mut new_line = 0usize; // next new-side line number within the current hunk
+    // Lines still owed to the current hunk per side. While either is non-zero every line is
+    // content, so a body like `++x` (diff line `+++x`) is never mistaken for a file header.
+    let (mut old_rem, mut new_rem) = (0usize, 0usize);
 
     for line in diff.lines() {
+        if old_rem > 0 || new_rem > 0 {
+            let first = line.as_bytes().first();
+            // Content lines always carry a prefix char; anything else means the hunk ended
+            // short (malformed input) — fall through and treat it as a header.
+            if matches!(first, None | Some(b'+' | b'-' | b' ' | b'\\')) {
+                let f = current.as_mut();
+                match first {
+                    Some(b'+') => {
+                        if let Some(f) = f {
+                            f.changed_bodies.push((new_line, 1, line[1..].to_string()));
+                        }
+                        new_line += 1;
+                        new_rem = new_rem.saturating_sub(1);
+                    }
+                    Some(b'-') => {
+                        // A removed line has no new-side position, so attribute it to where it
+                        // was removed (the next new line); its branch tokens subtract.
+                        if let Some(f) = f {
+                            f.changed_bodies.push((new_line, -1, line[1..].to_string()));
+                        }
+                        old_rem = old_rem.saturating_sub(1);
+                    }
+                    Some(b'\\') => {} // `\ No newline at end of file`
+                    // Context; an empty line is context whose leading space was stripped
+                    // (`diff.suppressBlankEmpty`).
+                    _ => {
+                        new_line += 1;
+                        old_rem = old_rem.saturating_sub(1);
+                        new_rem = new_rem.saturating_sub(1);
+                    }
+                }
+                continue;
+            }
+            old_rem = 0;
+            new_rem = 0;
+        }
+
         if line.starts_with("diff --git") {
             if let Some(f) = current.take() {
                 files.push(f);
@@ -187,6 +240,8 @@ fn parse_diff(diff: &str) -> Vec<ChangedFile> {
             continue;
         }
         if let Some(path) = line.strip_prefix("+++ b/") {
+            // git appends a tab to the header when the path contains a space.
+            let path = path.strip_suffix('\t').unwrap_or(path);
             current = Some(ChangedFile {
                 path: path.to_string(),
                 new_blob: pending_blob.take(),
@@ -194,31 +249,22 @@ fn parse_diff(diff: &str) -> Vec<ChangedFile> {
             });
             continue;
         }
-        if line.starts_with("+++") || line.starts_with("---") {
+        if line.starts_with("+++ \"") {
+            // C-quoted path (`"`, `\`, control chars survive core.quotePath=false). Not
+            // unquoted here; say so rather than drop the file silently.
+            eprintln!("chsig: skipping quoted path {}", &line[4..]);
             continue;
         }
         if let Some(rest) = line.strip_prefix("@@ ") {
-            // @@ -old,s +new,s @@ ... — take the new-side start line.
-            new_line = parse_hunk_new_start(rest).unwrap_or(0);
+            if let Some(h) = parse_hunk_header(rest) {
+                new_line = h.new_start;
+                old_rem = h.old_count;
+                new_rem = h.new_count;
+            }
             continue;
         }
-
-        let Some(f) = current.as_mut() else { continue };
-        match line.as_bytes().first() {
-            Some(b'+') => {
-                f.changed_bodies.push((new_line, 1, line[1..].to_string()));
-                new_line += 1;
-            }
-            Some(b'-') => {
-                // A removed line has no new-side position, so attribute it to where it was
-                // removed (the next new line); its branch tokens subtract.
-                f.changed_bodies.push((new_line, -1, line[1..].to_string()));
-            }
-            Some(b' ') => {
-                new_line += 1;
-            }
-            _ => {} // blank lines, `\ No newline at end of file`, etc.
-        }
+        // Remaining lines outside a hunk (`---`/`+++ /dev/null`, mode, rename, binary
+        // notices) carry nothing parse_diff uses.
     }
     if let Some(f) = current.take() {
         files.push(f);
@@ -226,12 +272,31 @@ fn parse_diff(diff: &str) -> Vec<ChangedFile> {
     files
 }
 
-fn parse_hunk_new_start(rest: &str) -> Option<usize> {
-    // rest e.g. "-10,7 +12,9 @@ fn foo()"
-    let plus = rest.split_whitespace().find(|t| t.starts_with('+'))?;
-    let digits = &plus[1..];
-    let num = digits.split(',').next()?;
-    num.parse().ok()
+struct HunkHeader {
+    old_count: usize,
+    new_start: usize,
+    new_count: usize,
+}
+
+/// `rest` is the part after `@@ `, e.g. "-10,7 +12,9 @@ fn foo()". An omitted count is 1.
+fn parse_hunk_header(rest: &str) -> Option<HunkHeader> {
+    let range = |prefix: char| -> Option<(usize, usize)> {
+        let tok = rest.split_whitespace().find(|t| t.starts_with(prefix))?;
+        let mut it = tok[1..].splitn(2, ',');
+        let start = it.next()?.parse().ok()?;
+        let count = match it.next() {
+            Some(c) => c.parse().ok()?,
+            None => 1,
+        };
+        Some((start, count))
+    };
+    let (_, old_count) = range('-')?;
+    let (new_start, new_count) = range('+')?;
+    Some(HunkHeader {
+        old_count,
+        new_start,
+        new_count,
+    })
 }
 
 // ---- symbol resolution + signal aggregation --------------------------------
@@ -277,7 +342,7 @@ fn collect_symbols(root: &str, file: &ChangedFile, side: SourceSide) -> Vec<Symb
     attribute_signals(&source, &file.path, file)
         .into_iter()
         .map(|(name, branch_delta, boundaries)| {
-            let refs = ref_line_count(&name);
+            let refs = ref_line_count(root, &name);
             SymbolSignals {
                 name,
                 signals: Signals {
@@ -297,7 +362,8 @@ fn collect_symbols(root: &str, file: &ChangedFile, side: SourceSide) -> Vec<Symb
 enum SourceSide {
     /// Plain `git diff`, `git diff <rev>`, path-limited diff: the new side is the working file.
     Worktree,
-    /// `--cached`/`--staged`, a `..`/`...` range, or two revisions: the new side is a stored blob.
+    /// `--cached`/`--staged`, a `..`/`...`/`^!`/`^-` range, or two revisions: the new side is a
+    /// stored blob.
     Blob,
 }
 
@@ -310,7 +376,12 @@ fn source_side(args: &[String]) -> SourceSide {
         if a == "--" {
             break; // pathspecs follow; they don't change the side
         }
-        if a == "--cached" || a == "--staged" || a.contains("..") {
+        if a == "--cached"
+            || a == "--staged"
+            || a.contains("..")
+            || a.contains("^!")
+            || a.contains("^-")
+        {
             return SourceSide::Blob;
         }
         if !a.starts_with('-') {
@@ -355,29 +426,33 @@ fn read_new_side(root: &str, file: &ChangedFile, side: SourceSide) -> Option<Str
 /// A changed line goes to the *innermost* def whose `[start, end]` body contains it (greatest
 /// start among containing defs). A line outside every handler body but inside the component
 /// thus lands on the component, not on the last handler above it. refs is added by the caller.
+///
+/// Signals aggregate per def, not per name: two `fn new` in different impls of one file stay
+/// two rows rather than summing into one.
 fn attribute_signals(
     source: &str,
     path: &str,
     file: &ChangedFile,
 ) -> Vec<(String, i32, Vec<&'static str>)> {
     let defs = find_symbol_defs(path, source);
-    let enclosing = |line: usize| -> Option<&str> {
+    let enclosing = |line: usize| -> Option<usize> {
         defs.iter()
-            .filter(|d| d.start <= line && line <= d.end)
-            .max_by_key(|d| d.start)
-            .map(|d| d.name.as_str())
+            .enumerate()
+            .filter(|(_, d)| d.start <= line && line <= d.end)
+            .max_by_key(|(_, d)| d.start)
+            .map(|(i, _)| i)
     };
 
-    let mut order: Vec<String> = Vec::new();
-    let mut agg: BTreeMap<String, (i32, Vec<&'static str>)> = BTreeMap::new();
+    let mut order: Vec<usize> = Vec::new();
+    let mut agg: BTreeMap<usize, (i32, Vec<&'static str>)> = BTreeMap::new();
     for (line, sign, body) in &file.changed_bodies {
-        let Some(name) = enclosing(*line) else {
+        let Some(def) = enclosing(*line) else {
             continue;
         };
-        if !agg.contains_key(name) {
-            order.push(name.to_string());
+        if !agg.contains_key(&def) {
+            order.push(def);
         }
-        let entry = agg.entry(name.to_string()).or_default();
+        let entry = agg.entry(def).or_default();
         entry.0 += sign * branch_tokens(body);
         // A boundary is a presence marker: touching it in either direction tags the symbol.
         for b in boundary_tags(body) {
@@ -392,9 +467,9 @@ fn attribute_signals(
     // more needs collecting here.
     order
         .into_iter()
-        .map(|name| {
-            let (branch, boundaries) = agg.remove(&name).unwrap_or_default();
-            (name, branch, boundaries)
+        .map(|def| {
+            let (branch, boundaries) = agg.remove(&def).unwrap_or_default();
+            (defs[def].name.clone(), branch, boundaries)
         })
         .collect()
 }
@@ -574,6 +649,9 @@ mod tests {
         assert!(matches!(s(&["--cached"]), SourceSide::Blob));
         assert!(matches!(s(&["main...HEAD"]), SourceSide::Blob));
         assert!(matches!(s(&["HEAD~1", "HEAD"]), SourceSide::Blob));
+        assert!(matches!(s(&["HEAD^!"]), SourceSide::Blob)); // commit vs its parent
+        assert!(matches!(s(&["HEAD^-"]), SourceSide::Blob));
+        assert!(matches!(s(&["HEAD^-2"]), SourceSide::Blob));
         assert!(matches!(s(&["--", "src/foo.ts"]), SourceSide::Worktree)); // pathspec, not a rev
     }
 
@@ -777,10 +855,96 @@ index abc1234..def5678 100644
         assert_eq!(f.changed_bodies[1], (2, 1, "new1".into()));
     }
 
+    // Bodies starting with `++`/`--` produce diff lines `+++x`/`---x`. Inside a hunk they are
+    // content, not file headers: they must be kept, keep line numbers aligned, and not end the
+    // file. The second file proves the next real header is still recognized.
     #[test]
-    fn hunk_new_start_reads_plus_side() {
-        assert_eq!(parse_hunk_new_start("-10,7 +12,9 @@ fn foo()"), Some(12));
-        assert_eq!(parse_hunk_new_start("-1 +1 @@"), Some(1));
+    fn parse_diff_keeps_header_lookalike_bodies_inside_hunk() {
+        let diff = "\
+diff --git a/x.rs b/x.rs
+index abc1234..def5678 100644
+--- a/x.rs
++++ b/x.rs
+@@ -1,3 +1,4 @@
+ fn a() {
+--- a sql comment
++++n;
++if y {}
+ }
+diff --git a/y.rs b/y.rs
+index 1111111..2222222 100644
+--- a/y.rs
++++ b/y.rs
+@@ -1 +1 @@
+-old
++new
+";
+        let files = parse_diff(diff);
+        assert_eq!(files.len(), 2);
+        assert_eq!(
+            files[0].changed_bodies,
+            vec![
+                (2, -1, "-- a sql comment".to_string()),
+                (2, 1, "++n;".to_string()),
+                (3, 1, "if y {}".to_string()),
+            ]
+        );
+        assert_eq!(files[1].path, "y.rs");
+        assert_eq!(files[1].changed_bodies.len(), 2);
+    }
+
+    // git appends a tab to `+++ b/<path>` when the path contains a space; `diff.suppressBlankEmpty`
+    // emits empty context lines without the leading space — both must keep line numbers right.
+    #[test]
+    fn parse_diff_strips_header_tab_and_counts_empty_context() {
+        let diff = "diff --git a/s p.rs b/s p.rs\nindex abc1234..def5678 100644\n--- a/s p.rs\t\n+++ b/s p.rs\t\n@@ -1,2 +1,3 @@\n fn a() {\n\n+x\n";
+        let files = parse_diff(diff);
+        assert_eq!(files[0].path, "s p.rs");
+        assert_eq!(files[0].changed_bodies, vec![(3, 1, "x".to_string())]);
+    }
+
+    #[test]
+    fn hunk_header_reads_counts_with_default_one() {
+        let h = parse_hunk_header("-10,7 +12,9 @@ fn foo()").unwrap();
+        assert_eq!((h.old_count, h.new_start, h.new_count), (7, 12, 9));
+        let h = parse_hunk_header("-1 +1 @@").unwrap();
+        assert_eq!((h.old_count, h.new_start, h.new_count), (1, 1, 1));
+        let h = parse_hunk_header("-3,2 +2,0 @@").unwrap();
+        assert_eq!((h.old_count, h.new_start, h.new_count), (2, 2, 0));
+    }
+
+    // Same-named defs in one file (`new` in two impls) are separate symbols; each keeps its own
+    // signals instead of being summed under one name.
+    #[test]
+    fn same_name_defs_stay_separate_rows() {
+        let source = "\
+impl A {
+    fn new() {
+        if a {}
+    }
+}
+impl B {
+    fn new() {
+        if b && c {}
+    }
+}
+";
+        let file = ChangedFile {
+            path: "n.rs".into(),
+            new_blob: None,
+            changed_bodies: vec![
+                (3, 1, "        if a {}".into()),
+                (8, 1, "        if b && c {}".into()),
+            ],
+        };
+        let out = attribute_signals(source, "n.rs", &file);
+        assert_eq!(
+            out,
+            vec![
+                ("new".to_string(), 1, vec![]),
+                ("new".to_string(), 2, vec![])
+            ]
+        );
     }
 
     #[test]

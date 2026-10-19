@@ -12,19 +12,20 @@ set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Prefer a locally built binary; fall back to one on PATH.
+# Use the most recently built of the local builds and the one on PATH, so a stale
+# target/debug never shadows a newer install (or vice versa).
 chsig=""
-for cand in "$here/target/release/chsig" "$here/target/debug/chsig"; do
-  if [ -x "$cand" ]; then chsig="$cand"; break; fi
+for cand in "$here/target/release/chsig" "$here/target/debug/chsig" "$(command -v chsig || true)"; do
+  [ -n "$cand" ] && [ -x "$cand" ] || continue
+  if [ -z "$chsig" ] || [ "$cand" -nt "$chsig" ]; then chsig="$cand"; fi
 done
-[ -n "$chsig" ] || chsig="$(command -v chsig || true)"
 [ -n "$chsig" ] || { echo "chsig-prioritize: chsig binary not found (build it first)" >&2; exit 1; }
 command -v claude >/dev/null 2>&1 || { echo "chsig-prioritize: claude CLI not found" >&2; exit 1; }
 
 # chsig runs in the caller's repo (its own cwd), not this script's dir.
 signals="$("$chsig" "$@")"
 if [ -z "${signals//[[:space:]]/}" ]; then
-  echo "chsig-prioritize: no signals (empty diff?)" >&2
+  echo "chsig-prioritize: no signals (empty diff, or no change inside a recognized symbol)" >&2
   exit 0
 fi
 
