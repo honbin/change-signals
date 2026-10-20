@@ -29,7 +29,7 @@ signals  →  prioritize  →  interrogate
 ## Install from source
 
 ```sh
-cargo install --path .    # puts `chsig` on PATH
+cargo install --locked --path .    # puts `chsig` on PATH
 ```
 
 Needs a Rust toolchain. Run `chsig` from inside the repo you want to read. The
