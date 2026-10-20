@@ -46,6 +46,16 @@ fn main() {
     };
 
     // Args pass straight to `git diff` (e.g. `chsig main...HEAD`); none = working diff.
+    // --relative would override the pinned --no-relative and make every path miss the
+    // root-based read, emptying the output; refuse it instead.
+    if let Some(a) = args
+        .iter()
+        .take_while(|a| *a != "--")
+        .find(|a| *a == "--relative" || a.starts_with("--relative="))
+    {
+        eprintln!("chsig: {a} is not supported (paths are read from the repo root)");
+        std::process::exit(1);
+    }
     let side = source_side(&args);
     let diff = git_diff(&args);
     if diff.trim().is_empty() {
@@ -376,17 +386,18 @@ fn source_side(args: &[String]) -> SourceSide {
         if a == "--" {
             break; // pathspecs follow; they don't change the side
         }
-        if a == "--cached"
-            || a == "--staged"
-            || a.contains("..")
-            || a.contains("^!")
-            || a.contains("^-")
-        {
+        if a == "--cached" || a == "--staged" {
             return SourceSide::Blob;
         }
-        if !a.starts_with('-') {
-            revs += 1;
+        // Only revs carry range syntax; an option's attached value (`-G'[^-]x'`) must not
+        // read as one. A value passed as a separate arg is still misread.
+        if a.starts_with('-') {
+            continue;
         }
+        if a.contains("..") || a.contains("^!") || a.contains("^-") {
+            return SourceSide::Blob;
+        }
+        revs += 1;
     }
     if revs >= 2 {
         SourceSide::Blob
@@ -653,6 +664,11 @@ mod tests {
         assert!(matches!(s(&["HEAD^-"]), SourceSide::Blob));
         assert!(matches!(s(&["HEAD^-2"]), SourceSide::Blob));
         assert!(matches!(s(&["--", "src/foo.ts"]), SourceSide::Worktree)); // pathspec, not a rev
+        assert!(matches!(s(&["-G[^-]x"]), SourceSide::Worktree)); // option value, not a range
+        assert!(matches!(
+            s(&["--word-diff-regex=a..b"]),
+            SourceSide::Worktree
+        ));
     }
 
     fn names(path: &str, src: &str) -> Vec<String> {

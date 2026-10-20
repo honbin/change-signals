@@ -205,3 +205,21 @@ fn caret_bang_range_reads_the_commit_not_the_worktree() {
     assert!(!out.contains("alpha"), "alpha was not changed:\n{out}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// --relative would make every path miss the root-based read; it must fail loudly, not print
+// an empty result.
+#[test]
+fn relative_is_refused_not_silently_empty() {
+    let dir = repo_with_alpha_edit("relative", "sub/a.rs");
+    for arg in ["--relative", "--relative=sub"] {
+        let out = isolated(&mut Command::new(env!("CARGO_BIN_EXE_chsig")))
+            .arg(arg)
+            .current_dir(dir.join("sub"))
+            .output()
+            .expect("spawn chsig");
+        assert!(!out.status.success(), "{arg} should fail");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("not supported"), "{arg}: stderr was:\n{err}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
