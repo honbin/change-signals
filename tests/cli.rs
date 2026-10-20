@@ -223,3 +223,43 @@ fn relative_is_refused_not_silently_empty() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// A brace miscount is reported once per file on stderr; stdout keeps its exact shape. Covers
+// depth left open at EOF (`{` in a comment) and depth driven below 0 (`}` in a string).
+#[test]
+fn unbalanced_braces_warn_on_stderr_only() {
+    for (tag, stray) in [("open", "    // {\n"), ("neg", "    let s = \"}\";\n")] {
+        let dir = temp_repo(&format!("unbal-{tag}"));
+        let base =
+            format!("fn alpha() {{\n{stray}    let x = 1;\n}}\nfn beta() {{\n    let y = 2;\n}}\n");
+        std::fs::write(dir.join("a.rs"), &base).unwrap();
+        git(&dir, &["add", "a.rs"]);
+        git(&dir, &["commit", "-qm", "init"]);
+        std::fs::write(
+            dir.join("a.rs"),
+            base.replace("let y = 2;", "let y = 2;\n    if y > 0 {}"),
+        )
+        .unwrap();
+
+        let (out, err) = chsig_full(&dir, &[]);
+        assert_eq!(
+            out, "a.rs\n  beta                         refs=1, branch+1\n\n",
+            "{tag}"
+        );
+        assert_eq!(
+            err, "chsig: unbalanced braces in a.rs; symbol ranges may be off\n",
+            "{tag}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// Balanced files stay silent on stderr.
+#[test]
+fn balanced_file_has_no_warning() {
+    let dir = repo_with_alpha_edit("balanced", "a.rs");
+    let (out, err) = chsig_full(&dir, &[]);
+    assert!(out.contains("alpha"), "expected alpha in:\n{out}");
+    assert_eq!(err, "");
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -349,7 +349,14 @@ fn collect_symbols(root: &str, file: &ChangedFile, side: SourceSide) -> Vec<Symb
     let Some(source) = read_new_side(root, file, side) else {
         return Vec::new(); // deleted, binary, unreadable, or new side absent in the chosen source
     };
-    attribute_signals(&source, &file.path, file)
+    let parsed = find_symbol_defs(&file.path, &source);
+    if !parsed.balanced {
+        eprintln!(
+            "chsig: unbalanced braces in {}; symbol ranges may be off",
+            file.path
+        );
+    }
+    attribute_signals(&parsed.defs, file)
         .into_iter()
         .map(|(name, branch_delta, boundaries)| {
             let refs = ref_line_count(root, &name);
@@ -441,11 +448,9 @@ fn read_new_side(root: &str, file: &ChangedFile, side: SourceSide) -> Option<Str
 /// Signals aggregate per def, not per name: two `fn new` in different impls of one file stay
 /// two rows rather than summing into one.
 fn attribute_signals(
-    source: &str,
-    path: &str,
+    defs: &[SymbolDef],
     file: &ChangedFile,
 ) -> Vec<(String, i32, Vec<&'static str>)> {
-    let defs = find_symbol_defs(path, source);
     let enclosing = |line: usize| -> Option<usize> {
         defs.iter()
             .enumerate()
@@ -495,6 +500,13 @@ struct SymbolDef {
     depth: i32,   // brace depth at the start of the def line
 }
 
+struct SymbolDefs {
+    defs: Vec<SymbolDef>,
+    /// False when depth went below 0 or didn't return to 0 at EOF — spans may then be off.
+    /// A miscount that cancels out (a stray `{` and `}`) still passes as balanced.
+    balanced: bool,
+}
+
 /// Definitions with body spans, ascending by start, for the file's language.
 ///
 /// Only Rust and TS/JS are parsed; any other extension returns empty rather than being
@@ -504,13 +516,21 @@ struct SymbolDef {
 /// binding; deeper local bindings like `const outcome = ...` are dropped). The same depth
 /// counter gives each def's `end` — the line where depth returns to the def's level — so a
 /// change outside a def's body attributes to the enclosing def, not to this one. Brace
-/// counting is off inside strings/comments (accepted noise); no tree-sitter.
-fn find_symbol_defs(path: &str, source: &str) -> Vec<SymbolDef> {
+/// counting is off inside strings/comments (accepted noise, surfaced via `balanced`); no
+/// lexer, no tree-sitter — a line-local strip of literals was measured to break more files
+/// than it fixed.
+fn find_symbol_defs(path: &str, source: &str) -> SymbolDefs {
     let def: fn(&str) -> Option<String> = match path.rsplit_once('.').map(|(_, ext)| ext) {
         Some("rs") => rust_def,
         Some("ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs") => ts_def,
-        _ => return Vec::new(),
+        _ => {
+            return SymbolDefs {
+                defs: Vec::new(),
+                balanced: true,
+            };
+        }
     };
+    let mut balanced = true;
     let mut finalized: Vec<SymbolDef> = Vec::new();
     let mut open: Vec<SymbolDef> = Vec::new(); // defs whose body has not closed yet
     let mut depth: i32 = 0;
@@ -526,7 +546,11 @@ fn find_symbol_defs(path: &str, source: &str) -> Vec<SymbolDef> {
                 depth,
             });
         }
-        depth = (depth + brace_delta(line)).max(0);
+        depth += brace_delta(line);
+        if depth < 0 {
+            balanced = false;
+            depth = 0;
+        }
         // A def closes once depth returns to (or below) its own level. A one-liner closes on
         // its own line; a brace def closes at the matching `}`.
         while let Some(top) = open.last() {
@@ -540,13 +564,19 @@ fn find_symbol_defs(path: &str, source: &str) -> Vec<SymbolDef> {
         }
     }
     // Unbalanced braces (EOF inside a body): close the rest at the last line.
+    if depth != 0 {
+        balanced = false;
+    }
     let last = source.lines().count();
     for mut d in open.drain(..) {
         d.end = last;
         finalized.push(d);
     }
     finalized.sort_by_key(|d| d.start);
-    finalized
+    SymbolDefs {
+        defs: finalized,
+        balanced,
+    }
 }
 
 fn brace_delta(line: &str) -> i32 {
@@ -671,8 +701,17 @@ mod tests {
         ));
     }
 
+    fn attribute(
+        source: &str,
+        path: &str,
+        file: &ChangedFile,
+    ) -> Vec<(String, i32, Vec<&'static str>)> {
+        attribute_signals(&find_symbol_defs(path, source).defs, file)
+    }
+
     fn names(path: &str, src: &str) -> Vec<String> {
         find_symbol_defs(path, src)
+            .defs
             .into_iter()
             .map(|d| d.name)
             .collect()
@@ -700,7 +739,7 @@ const Component = () => {
             new_blob: None,
             changed_bodies: vec![(7, 1, "    condition && <Child />".into())],
         };
-        let out = attribute_signals(source, "c.tsx", &file);
+        let out = attribute(source, "c.tsx", &file);
         assert_eq!(out, vec![("Component".to_string(), 1, vec![])]);
         assert!(!out.iter().any(|(n, _, _)| n == "handleClick"));
     }
@@ -722,7 +761,7 @@ fn foo() {
                 (2, -1, "    if x {}".into()), // removed branch
             ],
         };
-        let out = attribute_signals(source, "x.rs", &file);
+        let out = attribute(source, "x.rs", &file);
         assert_eq!(out, vec![("foo".to_string(), 0, vec![])]);
     }
 
@@ -742,7 +781,7 @@ fn beta() {
 }
 ";
         // Span check documents the early close: alpha's body is truncated at line 2.
-        let defs = find_symbol_defs("a.rs", source);
+        let defs = find_symbol_defs("a.rs", source).defs;
         let alpha = defs.iter().find(|d| d.name == "alpha").unwrap();
         assert_eq!((alpha.start, alpha.end), (1, 2)); // true body is lines 1..=4
 
@@ -752,7 +791,7 @@ fn beta() {
             new_blob: None,
             changed_bodies: vec![(3, 1, "    if p && q {}".into())],
         };
-        let out = attribute_signals(source, "a.rs", &file);
+        let out = attribute(source, "a.rs", &file);
         assert!(out.is_empty()); // DEFECT: silently dropped; should be [("alpha", 1, [])]
     }
 
@@ -777,7 +816,7 @@ fn bar() {
                 (1, -1, "}".into()),
             ],
         };
-        let out = attribute_signals(source, "b.rs", &file);
+        let out = attribute(source, "b.rs", &file);
         assert_eq!(out, vec![("bar".to_string(), -1, vec![])]); // DEFECT: bar was not changed
     }
 
@@ -800,11 +839,22 @@ export const makeRequest = () => new Req()
         );
     }
 
+    // Both miscount directions are flagged: a `{` in a comment leaves depth open at EOF, a
+    // `}` in a string drives it below 0. Literal braces that cancel out are not detectable.
+    #[test]
+    fn balance_flags_both_miscount_directions() {
+        let b = |src: &str| find_symbol_defs("a.rs", src).balanced;
+        assert!(b("fn a() {\n    let x = 1;\n}\n"));
+        assert!(!b("fn a() {\n    // {\n}\n"));
+        assert!(!b("fn a() {\n    let s = \"}\";\n}\n"));
+        assert!(b("fn a() {\n    let s = \"{}\";\n}\n"));
+    }
+
     #[test]
     fn unsupported_language_has_no_symbols() {
         // A .go file must not be run through the TS/JS parser (would accidentally match).
         let src = "var f = func() {";
-        assert!(find_symbol_defs("main.go", src).is_empty());
+        assert!(find_symbol_defs("main.go", src).defs.is_empty());
     }
 
     #[test]
@@ -953,7 +1003,7 @@ impl B {
                 (8, 1, "        if b && c {}".into()),
             ],
         };
-        let out = attribute_signals(source, "n.rs", &file);
+        let out = attribute(source, "n.rs", &file);
         assert_eq!(
             out,
             vec![

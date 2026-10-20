@@ -83,6 +83,9 @@ tool picks where to look, not what to conclude.
 - `branch` and the boundary tags (`db`/`cache`/`net`) are crude substring markers, not
   semantic analysis.
 - Nested / multi-line constructs may attribute coarsely to the parent symbol.
+- Braces are counted without skipping strings or comments. When the count doesn't return to
+  zero (or goes below it), chsig warns `unbalanced braces in <file>; symbol ranges may be off`
+  on stderr. A stray `{` and `}` that cancel out are not detected and can still shift a range.
 - No risk score and no safe-to-skip verdict — it only points at where to read.
 
 These are deliberate: making any of them precise means type resolution or a real parser,
