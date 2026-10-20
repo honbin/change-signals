@@ -36,12 +36,9 @@ const NET_VOCAB: &[&str] = &["fetch(", "http", "axios"];
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
-    let root = match git_root() {
-        Some(r) => r,
-        None => {
-            eprintln!("chsig: not a git repository");
-            std::process::exit(1);
-        }
+    let Some(root) = git_root() else {
+        eprintln!("chsig: not a git repository");
+        std::process::exit(1);
     };
 
     // Args pass straight to `git diff` (e.g. `chsig main...HEAD`); none = working diff.
@@ -541,14 +538,9 @@ fn find_symbol_defs(path: &str, source: &str) -> SymbolDefs {
         }
         // A def closes once depth returns to (or below) its own level. A one-liner closes on
         // its own line; a brace def closes at the matching `}`.
-        while let Some(top) = open.last() {
-            if depth <= top.depth {
-                let mut done = open.pop().expect("checked by last()");
-                done.end = line_no;
-                finalized.push(done);
-            } else {
-                break;
-            }
+        while let Some(mut done) = open.pop_if(|top| depth <= top.depth) {
+            done.end = line_no;
+            finalized.push(done);
         }
     }
     // Unbalanced braces (EOF inside a body): close the rest at the last line.
