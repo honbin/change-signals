@@ -7,7 +7,6 @@
 //! in diff order. Ranking is the `prioritize` stage (LLM); drilling is `interrogate` — both
 //! downstream of this tool.
 
-use std::collections::BTreeMap;
 use std::io::{self, Write};
 use std::process::Command;
 
@@ -356,20 +355,11 @@ fn collect_symbols(root: &str, file: &ChangedFile, side: SourceSide) -> Vec<Symb
             file.path
         );
     }
-    attribute_signals(&parsed.defs, file)
-        .into_iter()
-        .map(|(name, branch_delta, boundaries)| {
-            let refs = ref_line_count(root, &name);
-            SymbolSignals {
-                name,
-                signals: Signals {
-                    refs,
-                    branch_delta,
-                    boundaries,
-                },
-            }
-        })
-        .collect()
+    let mut symbols = attribute_signals(&parsed.defs, file);
+    for sym in &mut symbols {
+        sym.signals.refs = ref_line_count(root, &sym.name);
+    }
+    symbols
 }
 
 /// Where the new side of the diff lives, decided once from the invocation. The two are never
@@ -443,14 +433,12 @@ fn read_new_side(root: &str, file: &ChangedFile, side: SourceSide) -> Option<Str
 ///
 /// A changed line goes to the *innermost* def whose `[start, end]` body contains it (greatest
 /// start among containing defs). A line outside every handler body but inside the component
-/// thus lands on the component, not on the last handler above it. refs is added by the caller.
+/// thus lands on the component, not on the last handler above it. refs is left `None` for the
+/// caller to measure.
 ///
 /// Signals aggregate per def, not per name: two `fn new` in different impls of one file stay
 /// two rows rather than summing into one.
-fn attribute_signals(
-    defs: &[SymbolDef],
-    file: &ChangedFile,
-) -> Vec<(String, i32, Vec<&'static str>)> {
+fn attribute_signals(defs: &[SymbolDef], file: &ChangedFile) -> Vec<SymbolSignals> {
     let enclosing = |line: usize| -> Option<usize> {
         defs.iter()
             .enumerate()
@@ -459,33 +447,33 @@ fn attribute_signals(
             .map(|(i, _)| i)
     };
 
-    let mut order: Vec<usize> = Vec::new();
-    let mut agg: BTreeMap<usize, (i32, Vec<&'static str>)> = BTreeMap::new();
+    let mut touched: Vec<(usize, Signals)> = Vec::new();
     for (line, sign, body) in &file.changed_bodies {
         let Some(def) = enclosing(*line) else {
             continue;
         };
-        if !agg.contains_key(&def) {
-            order.push(def);
-        }
-        let entry = agg.entry(def).or_default();
-        entry.0 += sign * branch_tokens(body);
+        let i = match touched.iter().position(|(d, _)| *d == def) {
+            Some(i) => i,
+            None => {
+                touched.push((def, Signals::default()));
+                touched.len() - 1
+            }
+        };
+        let signals = &mut touched[i].1;
+        signals.branch_delta += sign * branch_tokens(body);
         // A boundary is a presence marker: touching it in either direction tags the symbol.
         for b in boundary_tags(body) {
-            if !entry.1.contains(&b) {
-                entry.1.push(b);
+            if !signals.boundaries.contains(&b) {
+                signals.boundaries.push(b);
             }
         }
     }
 
-    // Every changed line (including every `+`) is already in `order` from the loop above —
-    // a symbol touched only by additions appears with branch 0 / no boundary — so nothing
-    // more needs collecting here.
-    order
+    touched
         .into_iter()
-        .map(|def| {
-            let (branch, boundaries) = agg.remove(&def).unwrap_or_default();
-            (defs[def].name.clone(), branch, boundaries)
+        .map(|(def, signals)| SymbolSignals {
+            name: defs[def].name.clone(),
+            signals,
         })
         .collect()
 }
@@ -707,6 +695,9 @@ mod tests {
         file: &ChangedFile,
     ) -> Vec<(String, i32, Vec<&'static str>)> {
         attribute_signals(&find_symbol_defs(path, source).defs, file)
+            .into_iter()
+            .map(|s| (s.name, s.signals.branch_delta, s.signals.boundaries))
+            .collect()
     }
 
     fn names(path: &str, src: &str) -> Vec<String> {
