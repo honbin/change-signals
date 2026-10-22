@@ -132,7 +132,13 @@ fn git_stdout_or_exit(cmd: &mut Command) -> String {
         }
     };
     if !out.status.success() {
-        eprint!("{}", String::from_utf8_lossy(&out.stderr));
+        // User args can make git diff exit non-zero with nothing on stderr (--exit-code,
+        // --quiet, --check); say so rather than exit silently.
+        if out.stderr.is_empty() {
+            eprintln!("chsig: git failed ({})", out.status);
+        } else {
+            eprint!("{}", String::from_utf8_lossy(&out.stderr));
+        }
         std::process::exit(1);
     }
     String::from_utf8_lossy(&out.stdout).into_owned()

@@ -237,6 +237,22 @@ fn outside_a_repository_reports_gits_own_message() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// --exit-code makes git diff exit 1 on a non-empty diff with nothing on stderr; chsig must
+// not fail silently.
+#[test]
+fn a_silent_git_failure_is_reported() {
+    let dir = repo_with_alpha_edit("exitcode", "a.rs");
+    let out = isolated(&mut Command::new(env!("CARGO_BIN_EXE_chsig")))
+        .arg("--exit-code")
+        .current_dir(&dir)
+        .output()
+        .expect("spawn chsig");
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("chsig: git failed"), "stderr was:\n{err}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // --relative would make every path miss the root-based read; it must fail loudly, not print
 // an empty result.
 #[test]
