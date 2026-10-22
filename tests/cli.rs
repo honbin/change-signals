@@ -5,11 +5,12 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-// The developer's global/system git config must not leak into what these tests observe;
-// config under test is set per repo instead.
+// The developer's global/system git config and locale must not leak into what these tests
+// observe; config under test is set per repo instead.
 fn isolated(cmd: &mut Command) -> &mut Command {
     cmd.env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("LC_ALL", "C")
 }
 
 fn git(dir: &Path, args: &[&str]) {
@@ -203,6 +204,36 @@ fn caret_bang_range_reads_the_commit_not_the_worktree() {
     let out = chsig(&dir, &["HEAD^!"]);
     assert!(out.contains("beta"), "expected beta in:\n{out}");
     assert!(!out.contains("alpha"), "alpha was not changed:\n{out}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn missing_git_is_not_reported_as_not_a_repository() {
+    let dir = temp_repo("nogit");
+    let out = isolated(&mut Command::new(env!("CARGO_BIN_EXE_chsig")))
+        .env("PATH", "")
+        .current_dir(&dir)
+        .output()
+        .expect("spawn chsig");
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("failed to run git"), "stderr was:\n{err}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn outside_a_repository_reports_gits_own_message() {
+    let dir = std::env::temp_dir().join(format!("chsig-it-{}-norepo", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let out = isolated(&mut Command::new(env!("CARGO_BIN_EXE_chsig")))
+        .env("GIT_CEILING_DIRECTORIES", dir.parent().unwrap())
+        .current_dir(&dir)
+        .output()
+        .expect("spawn chsig");
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.starts_with("fatal: "), "stderr was:\n{err}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

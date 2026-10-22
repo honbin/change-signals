@@ -36,10 +36,7 @@ const NET_VOCAB: &[&str] = &["fetch(", "http", "axios"];
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
-    let Some(root) = git_root() else {
-        eprintln!("chsig: not a git repository");
-        std::process::exit(1);
-    };
+    let root = git_root();
 
     // Args pass straight to `git diff` (e.g. `chsig main...HEAD`); none = working diff.
     // --relative would override the pinned --no-relative and make every path miss the
@@ -100,22 +97,31 @@ fn exit_on_write_error(e: io::Error) -> ! {
 
 // ---- git -------------------------------------------------------------------
 
-fn git_root() -> Option<String> {
-    let out = Command::new("git")
+fn git_root() -> String {
+    let out = match Command::new("git")
         .args(["rev-parse", "--show-toplevel"])
         .output()
-        .ok()?;
+    {
+        Ok(out) => out,
+        Err(e) => {
+            eprintln!("chsig: failed to run git: {e}");
+            std::process::exit(1);
+        }
+    };
+    // Outside a repository is only one way this fails (dubious ownership, a broken .git);
+    // git's own message names the cause.
     if !out.status.success() {
-        return None;
+        eprint!("{}", String::from_utf8_lossy(&out.stderr));
+        std::process::exit(1);
     }
-    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
 fn git_diff(args: &[String]) -> String {
     // Pin the output shape parse_diff relies on against user config (color, mnemonic or no
     // prefix, external diff, relative paths, quoted non-ASCII paths). User args come after,
     // so an explicit flag still wins.
-    let out = Command::new("git")
+    let out = match Command::new("git")
         .args(["-c", "core.quotePath=false", "diff"])
         .args([
             "--no-color",
@@ -126,7 +132,13 @@ fn git_diff(args: &[String]) -> String {
         ])
         .args(args)
         .output()
-        .expect("failed to run git diff");
+    {
+        Ok(out) => out,
+        Err(e) => {
+            eprintln!("chsig: failed to run git: {e}");
+            std::process::exit(1);
+        }
+    };
     // A bad revision fails on stderr with empty stdout; without this it would look like an
     // empty diff and exit 0. Surface git's error and fail.
     if !out.status.success() {
