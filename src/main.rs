@@ -98,54 +98,44 @@ fn exit_on_write_error(e: io::Error) -> ! {
 // ---- git -------------------------------------------------------------------
 
 fn git_root() -> String {
-    let out = match Command::new("git")
-        .args(["rev-parse", "--show-toplevel"])
-        .output()
-    {
-        Ok(out) => out,
-        Err(e) => {
-            eprintln!("chsig: failed to run git: {e}");
-            std::process::exit(1);
-        }
-    };
-    // Outside a repository is only one way this fails (dubious ownership, a broken .git);
-    // git's own message names the cause.
-    if !out.status.success() {
-        eprint!("{}", String::from_utf8_lossy(&out.stderr));
-        std::process::exit(1);
-    }
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
+    git_stdout_or_exit(Command::new("git").args(["rev-parse", "--show-toplevel"]))
+        .trim()
+        .to_string()
 }
 
 fn git_diff(args: &[String]) -> String {
     // Pin the output shape parse_diff relies on against user config (color, mnemonic or no
     // prefix, external diff, relative paths, quoted non-ASCII paths). User args come after,
     // so an explicit flag still wins.
-    let out = match Command::new("git")
-        .args(["-c", "core.quotePath=false", "diff"])
-        .args([
-            "--no-color",
-            "--no-ext-diff",
-            "--no-relative",
-            "--src-prefix=a/",
-            "--dst-prefix=b/",
-        ])
-        .args(args)
-        .output()
-    {
+    git_stdout_or_exit(
+        Command::new("git")
+            .args(["-c", "core.quotePath=false", "diff"])
+            .args([
+                "--no-color",
+                "--no-ext-diff",
+                "--no-relative",
+                "--src-prefix=a/",
+                "--dst-prefix=b/",
+            ])
+            .args(args),
+    )
+}
+
+/// Exit on failure with git's own stderr: it names the cause (outside a repository, dubious
+/// ownership, a bad revision that would otherwise look like an empty diff).
+fn git_stdout_or_exit(cmd: &mut Command) -> String {
+    let out = match cmd.output() {
         Ok(out) => out,
         Err(e) => {
             eprintln!("chsig: failed to run git: {e}");
             std::process::exit(1);
         }
     };
-    // A bad revision fails on stderr with empty stdout; without this it would look like an
-    // empty diff and exit 0. Surface git's error and fail.
     if !out.status.success() {
         eprint!("{}", String::from_utf8_lossy(&out.stderr));
         std::process::exit(1);
     }
-    String::from_utf8_lossy(&out.stdout).to_string()
+    String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
 /// Count lines matching `name` across the repo's **tracked files in the current working tree** —
