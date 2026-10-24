@@ -3,10 +3,9 @@
 A small CLI that collects **facts** about the symbols a `git diff` changed, so a human can
 decide *where to read first*. It explains nothing and judges nothing — it points.
 
-It is **not** a static analyzer or a code-review tool: it runs no semantic analysis and
-makes no judgments. It pulls coarse signals out of a `git diff` as raw material for a
-human. **v0.x** — symbols are found with a parser (tree-sitter), but the signals attached
-to them are crude on purpose; the output is meant to be skimmed and falsified, not trusted.
+It is **not** a static analyzer or a code-review tool: it runs no semantic analysis.
+**v0.x** — symbols are found with a parser (tree-sitter), but the signals attached to them
+are crude on purpose; the output is meant to be skimmed and falsified, not trusted.
 
 ```
 signals  →  prioritize  →  interrogate
@@ -69,12 +68,12 @@ Pipes the signals to `claude -p`, which names the 3–5 symbols to read first wi
 signal-grounded reasons, and ends by naming one to interrogate.
 
 ```sh
-./chsig-prioritize main...HEAD
+/path/to/change-signals/chsig-prioritize main...HEAD    # run inside the target repo
 ```
 
 This is a thin shell layer, deliberately **not** part of the Rust binary: the LLM call is
 non-deterministic I/O and stays outside the deterministic core (`shell = fetch / toolbox =
-compute`). No judgment leaks back into the extractor. Requires `claude` on `PATH`.
+compute`). No judgment leaks back into the extractor.
 
 ### 3. interrogate
 
@@ -113,15 +112,14 @@ tool picks where to look, not what to conclude.
   whole content, such as Git LFS, still passes the check while the diff describes the pointer.
 - `refs` is `git grep`-based (tracked files across the whole repo, as in the working tree),
   matching the bare name, not resolved references.
-- `calls` names callees syntactically and resolves nothing: `tx` is just the receiver's name,
-  a receiver that is itself an expression (`(a + b).abs()`, a literal) shows as `*`, and a call
-  through an expression (`fns[i]()`) is not listed. Nor is a TypeScript tagged template with
-  type arguments (``sql<Row>`...` ``): the grammar misreads it, often without a parse error.
+- `calls` resolves nothing. A receiver with no name to show (`(a + b).abs()`, a literal) is
+  `*`, and a call through an expression (`fns[i]()`) is not listed. Nor is a TypeScript
+  tagged template with type arguments (``sql<Row>`...` ``): the grammar misreads it, often
+  without a parse error.
 - `branch` is the net change in branch points on changed lines, read from the syntax tree:
   `if` (an `else if` counts once), a final `else`, `case` / `default` / match arms, ternaries,
   `&&` / `||` / `??`, and Rust's `let ... else`; loops are not counted. It counts syntax, not
   paths through the code.
-- No risk score and no safe-to-skip verdict — it only points at where to read.
 
 The signals stay crude on purpose: making them precise means type resolution, which would
 turn this into a different, heavier tool. The coarseness keeps a human in the loop.

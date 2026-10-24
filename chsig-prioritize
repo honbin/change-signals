@@ -2,10 +2,9 @@
 # chsig-prioritize — the "prioritize" stage of signals -> prioritize -> interrogate.
 #
 # Pipes chsig's factual signals to `claude -p` so it names the 3-5 symbols to read first,
-# with signal-grounded reasons. Deliberately a thin shell layer, NOT Rust: the LLM call is
-# non-deterministic I/O and stays OUTSIDE the deterministic chsig core. I/O and judgment
-# live in this shell seam; computation stays in the binary. chsig emits facts; this turns
-# them into a reading order. The two never mix — no judgment leaks back into the extractor.
+# with signal-grounded reasons. Deliberately a thin shell layer, not Rust: the LLM call is
+# non-deterministic I/O, so it stays outside the deterministic chsig core and no judgment
+# leaks back into it.
 #
 # Usage: chsig-prioritize [git diff args]   e.g. chsig-prioritize main...HEAD
 set -euo pipefail
@@ -25,7 +24,7 @@ command -v claude >/dev/null 2>&1 || { echo "chsig-prioritize: claude CLI not fo
 # chsig runs in the caller's repo (its own cwd), not this script's dir.
 signals="$("$chsig" "$@")"
 if [ -z "${signals//[[:space:]]/}" ]; then
-  echo "chsig-prioritize: no signals (empty diff, or no change inside a recognized symbol)" >&2
+  echo "chsig-prioritize: no signals (empty diff, no change inside a recognized symbol, or every file skipped as noted above)" >&2
   exit 0
 fi
 
