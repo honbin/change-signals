@@ -278,7 +278,10 @@ fn collect_calls(node: Node, src: &str, out: &mut Vec<(usize, String)>) {
 
 fn callee<'t>(node: Node<'t>, src: &str) -> Option<(String, Node<'t>)> {
     match node.kind() {
-        "call_expression" => call_target(node.child_by_field_name("function")?, src),
+        "call_expression" => match misread_await(node) {
+            Some(awaited) => call_target(awaited, src),
+            None => call_target(node.child_by_field_name("function")?, src),
+        },
         "new_expression" => {
             let (name, at) = call_target(node.child_by_field_name("constructor")?, src)?;
             Some((format!("new {name}"), at))
@@ -289,6 +292,17 @@ fn callee<'t>(node: Node<'t>, src: &str) -> Option<(String, Node<'t>)> {
         }
         _ => None,
     }
+}
+
+/// tree-sitter-typescript reads `await f<T>()` as `(await f)<T>()`, without a parse error: a
+/// call with type arguments whose callee is the `await`. Read correctly an awaited callee is
+/// parenthesized (`(await f)()`), and a Rust call carries no type arguments of its own, so the
+/// shape comes only from the misreading. Returns `f`, the callee the source wrote.
+fn misread_await(call: Node) -> Option<Node> {
+    let f = call.child_by_field_name("function")?;
+    (f.kind() == "await_expression" && call.child_by_field_name("type_arguments").is_some())
+        .then(|| f.named_child(0))
+        .flatten()
 }
 
 /// The name a call goes to, and the node holding it (where the call is placed). A call whose
@@ -399,6 +413,9 @@ fn binds_function(value: Option<Node>) -> bool {
     if is_fn(value) {
         return true;
     }
+    if awaits_whole_chain(value) {
+        return false;
+    }
     let Some(args) = value
         .child_by_field_name("arguments")
         .filter(|_| value.kind() == "call_expression")
@@ -407,6 +424,25 @@ fn binds_function(value: Option<Node>) -> bool {
     };
     let mut cursor = args.walk();
     args.named_children(&mut cursor).any(is_fn)
+}
+
+/// Whether a misread `await` (see `misread_await`) heads the call chain of `value`. The source's
+/// `await` covers the whole chain (`await f<T>().catch(() => null)`), so the value is awaited, not
+/// a call handed a function.
+fn awaits_whole_chain(value: Node) -> bool {
+    let mut node = value;
+    loop {
+        let next = match node.kind() {
+            "call_expression" if misread_await(node).is_some() => return true,
+            "call_expression" => node.child_by_field_name("function"),
+            "member_expression" => node.child_by_field_name("object"),
+            _ => None,
+        };
+        let Some(next) = next else {
+            return false;
+        };
+        node = next;
+    }
 }
 
 /// The name `node` lends to the defs inside it: the type of an `impl`, a trait, a class, or the
@@ -640,6 +676,31 @@ fn f() {
                 "n.parse",
             ]
         );
+    }
+
+    // The grammar reads `await f<T>()` as `(await f)<T>()`; the call is still named by `f`, and
+    // a function handed to the awaited chain doesn't make its binding a def. A parenthesized
+    // `(await pick)()` is read correctly and stays unnamed, like any expression callee.
+    #[test]
+    fn awaited_generic_calls_are_named_by_their_callee() {
+        let src = "\
+async function load() {
+  const kv = await env.get<string>('k');
+  const rows = await client.query<{
+    id: number;
+  }>(sql);
+  const body = await req.json<Body>().catch(() => null);
+  const res = await run<Out>(() => 1);
+  const ok = (await pick)();
+}
+";
+        assert_eq!(
+            calls("a.ts", src),
+            vec!["env.get", "client.query", "req.catch", "req.json", "run"]
+        );
+        assert_eq!(names("a.ts", src), vec!["load"]);
+        let top = "export const res = await run<Out>(() => 1);\n";
+        assert!(names("a.ts", top).is_empty());
     }
 
     // Each call is placed on the line holding its name, so in a chain split across lines
