@@ -47,11 +47,11 @@ chsig                # no args = working diff
 
 ```
 src/cache/store.ts
-  getOrFetch                   refs=14, branch+5, cache
+  getOrFetch                   refs=14, branch+5
   evictExpired                 refs=6, branch+1
 
 src/db/records.ts
-  loadRecord                   refs=12, db
+  loadRecord                   refs=12
 ```
 
 ### 2. prioritize — `chsig-prioritize`
@@ -93,20 +93,12 @@ tool picks where to look, not what to conclude.
   in an interface or type literal separated only by newlines.
 - `refs` is `git grep`-based (tracked files across the whole repo, as in the working tree),
   matching the bare name, not resolved references.
-- `branch` and the boundary tags (`db`/`cache`/`net`) are crude substring markers, not
-  semantic analysis.
+- `branch` is a crude substring count of branch tokens (`if`, `&&`, `?.`, ...) on changed
+  lines, strings and comments included.
 - No risk score and no safe-to-skip verdict — it only points at where to read.
 
 The signals stay crude on purpose: making them precise means type resolution, which would
 turn this into a different, heavier tool. The coarseness keeps a human in the loop.
-
-## Tunables
-
-The one project-specific seam is the const block at the top of `src/main.rs` (the boundary
-vocabulary). It encodes the stack of the repo you point chsig at (e.g. react-query, SQL);
-edit it to retarget. Kept as consts rather than an external config file until a second repo
-needs different values — only then is the varying axis known well enough to design a
-schema. Until then the block *is* the example.
 
 ## Tests
 

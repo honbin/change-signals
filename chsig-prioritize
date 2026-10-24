@@ -37,7 +37,6 @@ Signal meanings (all facts, deliberately crude):
              references — strings/comments count, and short/common names (index, query, e)
              inflate. A high number alone is weak evidence.
 - branch±N : net change in branch tokens (if/else/match/&&/||/?.) within the diff.
-- db|cache|net : the change touches a line mentioning that boundary (a marker, not a score).
 
 Task: choose the 3-5 symbols that appear most useful to READ FIRST when investigating
 this change.

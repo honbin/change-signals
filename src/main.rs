@@ -16,24 +16,6 @@ use symbols::{SymbolDef, find_symbol_defs};
 mod diff;
 mod symbols;
 
-// ---- tunables tied to the target codebase ----------------------------------
-//
-// Everything here encodes assumptions about the repo chsig is pointed at — its stack
-// (react-query, SQL). This is the one project-specific seam; the rest of the file is
-// general. Edit these to retarget.
-//
-// Kept as plain consts, not an external config file: with a single consumer there is no
-// second data point to design a schema from. Promote to real config (env/flag, then a
-// file) when a second repo actually needs different values — that is when the varying
-// axis becomes known. Until then this block *is* the example.
-
-/// Boundary vocabulary: substrings that tag a changed line as touching a known boundary.
-/// A marker, not a risk score. "query" is deliberately absent — on the FE it fires on
-/// react-query (useQuery/queryKey), not a database.
-const DB_VOCAB: &[&str] = &["sql", "SELECT", "INSERT", "UPDATE", "DELETE"];
-const CACHE_VOCAB: &[&str] = &["queryKey", "invalidate", "setQueryData", "cache"];
-const NET_VOCAB: &[&str] = &["fetch(", "http", "axios"];
-
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
@@ -191,7 +173,6 @@ struct Signals {
     /// `export default`); shown as `refs=?`, distinct from `Some(0)`.
     refs: Option<usize>,
     branch_delta: i32,
-    boundaries: Vec<&'static str>,
 }
 
 impl Signals {
@@ -200,15 +181,11 @@ impl Signals {
             Some(n) => format!("refs={n}"),
             None => "refs=?".to_string(),
         };
-        let mut parts = vec![refs];
-        if self.branch_delta != 0 {
-            let sign = if self.branch_delta > 0 { "+" } else { "" };
-            parts.push(format!("branch{}{}", sign, self.branch_delta));
+        if self.branch_delta == 0 {
+            return refs;
         }
-        for b in &self.boundaries {
-            parts.push((*b).to_string());
-        }
-        parts.join(", ")
+        let sign = if self.branch_delta > 0 { "+" } else { "" };
+        format!("{refs}, branch{sign}{}", self.branch_delta)
     }
 }
 
@@ -331,12 +308,6 @@ fn attribute_signals(defs: &[SymbolDef], file: &ChangedFile) -> Vec<SymbolSignal
         };
         let signals = &mut touched[i].1;
         signals.branch_delta += sign * branch_tokens(body);
-        // A boundary is a presence marker: touching it in either direction tags the symbol.
-        for b in boundary_tags(body) {
-            if !signals.boundaries.contains(&b) {
-                signals.boundaries.push(b);
-            }
-        }
     }
 
     touched
@@ -359,22 +330,6 @@ fn branch_tokens(body: &str) -> i32 {
         .iter()
         .map(|tok| body.matches(tok).count() as i32)
         .sum()
-}
-
-/// Tag which recognizable boundaries a changed line touches — a marker ("this touches
-/// db/cache/network"), not a risk score. Vocabulary lives in the tunables block above.
-fn boundary_tags(body: &str) -> Vec<&'static str> {
-    let mut tags = Vec::new();
-    if DB_VOCAB.iter().any(|k| body.contains(k)) {
-        tags.push("db");
-    }
-    if CACHE_VOCAB.iter().any(|k| body.contains(k)) {
-        tags.push("cache");
-    }
-    if NET_VOCAB.iter().any(|k| body.contains(k)) {
-        tags.push("net");
-    }
-    tags
 }
 
 #[cfg(test)]
@@ -404,14 +359,10 @@ mod tests {
         ));
     }
 
-    fn attribute(
-        source: &str,
-        path: &str,
-        file: &ChangedFile,
-    ) -> Vec<(String, i32, Vec<&'static str>)> {
+    fn attribute(source: &str, path: &str, file: &ChangedFile) -> Vec<(String, i32)> {
         attribute_signals(&find_symbol_defs(path, source).defs, file)
             .into_iter()
-            .map(|s| (s.name, s.signals.branch_delta, s.signals.boundaries))
+            .map(|s| (s.name, s.signals.branch_delta))
             .collect()
     }
 
@@ -439,7 +390,7 @@ const Component = () => {
             ],
         };
         let out = attribute(source, "c.tsx", &file);
-        assert_eq!(out, vec![("Component".to_string(), 2, vec![])]);
+        assert_eq!(out, vec![("Component".to_string(), 2)]);
     }
 
     // A removed branch token subtracts: swapping `if true {}` for `if false {}` is net zero,
@@ -460,7 +411,7 @@ fn foo() {
             ],
         };
         let out = attribute(source, "x.rs", &file);
-        assert_eq!(out, vec![("foo".to_string(), 0, vec![])]);
+        assert_eq!(out, vec![("foo".to_string(), 0)]);
     }
 
     // A `}` inside a string used to close `alpha` early under brace counting, dropping the
@@ -482,7 +433,7 @@ fn beta() {
             changed_bodies: vec![(3, 1, "    if p && q {}".into())],
         };
         let out = attribute(source, "a.rs", &file);
-        assert_eq!(out, vec![("alpha".to_string(), 2, vec![])]);
+        assert_eq!(out, vec![("alpha".to_string(), 2)]);
     }
 
     // KNOWN DEFECT, pinned as current behavior — not endorsed. A symbol deleted above `bar` has no
@@ -507,7 +458,7 @@ fn bar() {
             ],
         };
         let out = attribute(source, "b.rs", &file);
-        assert_eq!(out, vec![("bar".to_string(), -1, vec![])]); // DEFECT: bar was not changed
+        assert_eq!(out, vec![("bar".to_string(), -1)]); // DEFECT: bar was not changed
     }
 
     // Same-named defs in one file (`new` in two impls) are separate symbols; each keeps its own
@@ -537,25 +488,14 @@ impl B {
         let out = attribute(source, "n.rs", &file);
         assert_eq!(
             out,
-            vec![
-                ("A::new".to_string(), 1, vec![]),
-                ("B::new".to_string(), 2, vec![])
-            ]
+            vec![("A::new".to_string(), 1), ("B::new".to_string(), 2)]
         );
     }
 
     #[test]
-    fn branch_and_boundary_are_substring_facts() {
+    fn branch_tokens_are_substring_facts() {
         assert_eq!(branch_tokens("if (a && b) {"), 2);
         assert_eq!(branch_tokens("const x = 5"), 0);
-        assert_eq!(
-            boundary_tags("queryClient.invalidateQueries()"),
-            vec!["cache"]
-        );
-        assert_eq!(boundary_tags("await fetch(url)"), vec!["net"]);
-        assert_eq!(boundary_tags("exec(\"SELECT 1\")"), vec!["db"]);
-        // "query" is intentionally not a db marker (react-query false-positive).
-        assert!(boundary_tags("const q = useQuery(").is_empty());
     }
 
     #[test]
@@ -563,25 +503,21 @@ impl B {
         let bare = Signals {
             refs: Some(3),
             branch_delta: 0,
-            boundaries: vec![],
         };
         assert_eq!(bare.render(), "refs=3");
-        let full = Signals {
+        let pos = Signals {
             refs: Some(3),
             branch_delta: 2,
-            boundaries: vec!["cache"],
         };
-        assert_eq!(full.render(), "refs=3, branch+2, cache");
+        assert_eq!(pos.render(), "refs=3, branch+2");
         let neg = Signals {
             refs: Some(1),
             branch_delta: -1,
-            boundaries: vec![],
         };
         assert_eq!(neg.render(), "refs=1, branch-1");
         let unmeasured = Signals {
             refs: None,
             branch_delta: 0,
-            boundaries: vec![],
         };
         assert_eq!(unmeasured.render(), "refs=?");
     }
