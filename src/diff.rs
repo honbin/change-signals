@@ -32,64 +32,101 @@ pub(crate) enum ChangedLine {
     Removed(usize),
 }
 
-pub(crate) fn parse_diff(diff: &str) -> Vec<ChangedFile> {
+/// git's output in a shape `parse_diff` doesn't read, holding the first line that showed it:
+/// an option changed the format (`--color`, `--word-diff`, `--stat`, `-R`). Read on, it would
+/// yield no changed lines and an empty result indistinguishable from a diff without symbols.
+#[derive(Debug)]
+pub(crate) struct Unreadable(pub(crate) String);
+
+pub(crate) fn parse_diff(diff: &str) -> Result<Vec<ChangedFile>, Unreadable> {
+    let unreadable = |line: &str| Err(Unreadable(line.to_string()));
     let mut files = Vec::new();
+    let mut seen_header = false;
     let mut current: Option<ChangedFile> = None;
     // Seen before the `+++` line, which completes the file header.
     let mut blobs: (Option<String>, Option<String>) = (None, None);
     let mut old_path: Option<String> = None;
     let mut quoted = false;
+    let mut combined = false;
     // Next line number within the current hunk, per side.
     let (mut old_line, mut new_line) = (0usize, 0usize);
     // Lines still owed to the current hunk per side. While either is non-zero every line is
     // content, so a body like `++x` (diff line `+++x`) is never mistaken for a file header.
     let (mut old_rem, mut new_rem) = (0usize, 0usize);
+    // The current hunk's header, until one of its lines is added or removed: git emits no hunk
+    // without a change, so one that ends unchanged was read wrongly.
+    let mut unchanged_hunk: Option<&str> = None;
 
     for line in diff.lines() {
         if old_rem > 0 || new_rem > 0 {
-            let first = line.as_bytes().first();
-            // Content lines always carry a prefix char; anything else means the hunk ended
-            // short (malformed input) — fall through and treat it as a header.
-            if matches!(first, None | Some(b'+' | b'-' | b' ' | b'\\')) {
-                let lines = current.as_mut().map(|f| &mut f.lines);
-                match first {
-                    Some(b'+') => {
-                        if let Some(lines) = lines {
-                            lines.push(ChangedLine::Added(new_line));
-                        }
-                        new_line += 1;
-                        new_rem = new_rem.saturating_sub(1);
+            let lines = current.as_mut().map(|f| &mut f.lines);
+            match line.as_bytes().first() {
+                Some(b'+') => {
+                    if let Some(lines) = lines {
+                        lines.push(ChangedLine::Added(new_line));
                     }
-                    Some(b'-') => {
-                        if let Some(lines) = lines {
-                            lines.push(ChangedLine::Removed(old_line));
-                        }
-                        old_line += 1;
-                        old_rem = old_rem.saturating_sub(1);
-                    }
-                    Some(b'\\') => {} // `\ No newline at end of file`
-                    // Context; an empty line is context whose leading space was stripped
-                    // (`diff.suppressBlankEmpty`).
-                    _ => {
-                        old_line += 1;
-                        new_line += 1;
-                        old_rem = old_rem.saturating_sub(1);
-                        new_rem = new_rem.saturating_sub(1);
-                    }
+                    new_line += 1;
+                    new_rem = new_rem.saturating_sub(1);
+                    unchanged_hunk = None;
                 }
-                continue;
+                Some(b'-') => {
+                    if let Some(lines) = lines {
+                        lines.push(ChangedLine::Removed(old_line));
+                    }
+                    old_line += 1;
+                    old_rem = old_rem.saturating_sub(1);
+                    unchanged_hunk = None;
+                }
+                Some(b'\\') => {} // `\ No newline at end of file`
+                // Context; an empty line is context whose leading space was stripped
+                // (`diff.suppressBlankEmpty`).
+                None | Some(b' ') => {
+                    old_line += 1;
+                    new_line += 1;
+                    old_rem = old_rem.saturating_sub(1);
+                    new_rem = new_rem.saturating_sub(1);
+                }
+                // A diff's content lines always carry a prefix; `--word-diff` lines don't.
+                Some(_) => return unreadable(line),
             }
-            old_rem = 0;
-            new_rem = 0;
+            if old_rem == 0
+                && new_rem == 0
+                && let Some(header) = unchanged_hunk
+            {
+                return unreadable(header);
+            }
+            continue;
         }
 
         if line.starts_with("diff --git") {
+            seen_header = true;
             if let Some(f) = current.take() {
                 files.push(f);
             }
             blobs = (None, None);
             old_path = None;
             quoted = false;
+            combined = false;
+            continue;
+        }
+        // git shows a merge, or a conflicted file in the worktree, as a combined diff even
+        // when asked for nothing special; its two-column lines read as no single side's.
+        if let Some(path) = ["diff --cc ", "diff --combined "]
+            .iter()
+            .find_map(|p| line.strip_prefix(p))
+        {
+            seen_header = true;
+            if let Some(f) = current.take() {
+                files.push(f);
+            }
+            eprintln!(
+                "chsig: skipping {path}: a combined diff (merge or conflict) is not read; \
+                 diff against one parent, as in `<merge>^1 <merge>` or `HEAD`"
+            );
+            combined = true;
+            continue;
+        }
+        if combined {
             continue;
         }
         if let Some(rest) = line.strip_prefix("index ") {
@@ -106,10 +143,6 @@ pub(crate) fn parse_diff(diff: &str) -> Vec<ChangedFile> {
         }
         // git appends a tab to a header path that contains a space.
         let header_path = |p: &str| p.strip_suffix('\t').unwrap_or(p).to_string();
-        if let Some(path) = line.strip_prefix("--- a/") {
-            old_path = Some(header_path(path));
-            continue;
-        }
         if line.starts_with("--- \"") || line.starts_with("+++ \"") {
             // C-quoted path (`"`, `\`, control chars survive core.quotePath=false). Not
             // unquoted here; say so rather than drop the file silently.
@@ -119,8 +152,18 @@ pub(crate) fn parse_diff(diff: &str) -> Vec<ChangedFile> {
             quoted = true;
             continue;
         }
+        // The pinned prefixes; anything else (`-R` swaps them) would leave both sides unread.
+        let side_path = |rest: &str, prefix: &str| match rest.strip_prefix(prefix) {
+            Some(path) => Ok(Some(header_path(path))),
+            None if rest == "/dev/null" => Ok(None),
+            None => Err(Unreadable(line.to_string())),
+        };
+        if let Some(rest) = line.strip_prefix("--- ") {
+            old_path = side_path(rest, "a/")?;
+            continue;
+        }
         if let Some(rest) = line.strip_prefix("+++ ") {
-            let new_path = rest.strip_prefix("b/").map(header_path);
+            let new_path = side_path(rest, "b/")?;
             if !quoted {
                 let (old_blob, new_blob) = std::mem::take(&mut blobs);
                 let side = |path: Option<String>, blob: Option<String>| {
@@ -143,6 +186,7 @@ pub(crate) fn parse_diff(diff: &str) -> Vec<ChangedFile> {
                 new_line = h.new_start;
                 old_rem = h.old_count;
                 new_rem = h.new_count;
+                unchanged_hunk = Some(line);
             }
             continue;
         }
@@ -152,7 +196,11 @@ pub(crate) fn parse_diff(diff: &str) -> Vec<ChangedFile> {
     if let Some(f) = current.take() {
         files.push(f);
     }
-    files
+    // `--stat`, `--name-only` and colored output carry no `diff --git` line at all.
+    if !seen_header && let Some(first) = diff.lines().find(|l| !l.trim().is_empty()) {
+        return unreadable(first);
+    }
+    Ok(files)
 }
 
 struct HunkHeader {
@@ -206,7 +254,7 @@ index abc1234..def5678 100644
 +new3
  line3
 ";
-        let files = parse_diff(diff);
+        let files = parse_diff(diff).unwrap();
         assert_eq!(files.len(), 1);
         let f = &files[0];
         assert_eq!(f.path(), "src/x.ts");
@@ -242,7 +290,7 @@ index 1111111..2222222 100644
 -old
 +new
 ";
-        let files = parse_diff(diff);
+        let files = parse_diff(diff).unwrap();
         assert_eq!(files.len(), 2);
         assert_eq!(files[0].lines, vec![Removed(2), Added(2), Added(3),]);
         assert_eq!(files[1].path(), "y.rs");
@@ -254,7 +302,7 @@ index 1111111..2222222 100644
     #[test]
     fn parse_diff_strips_header_tab_and_counts_empty_context() {
         let diff = "diff --git a/s p.rs b/s p.rs\nindex abc1234..def5678 100644\n--- a/s p.rs\t\n+++ b/s p.rs\t\n@@ -1,2 +1,3 @@\n fn a() {\n\n+x\n";
-        let files = parse_diff(diff);
+        let files = parse_diff(diff).unwrap();
         assert_eq!(files[0].path(), "s p.rs");
         assert_eq!(files[0].old.as_ref().unwrap().path, "s p.rs");
         assert_eq!(files[0].lines, vec![Added(3)]);
@@ -291,7 +339,7 @@ index 0000000..3333333
 @@ -0,0 +1 @@
 +fn b() {}
 ";
-        let files = parse_diff(diff);
+        let files = parse_diff(diff).unwrap();
         let sides: Vec<_> = files
             .iter()
             .map(|f| {
@@ -312,6 +360,58 @@ index 0000000..3333333
         );
         assert_eq!(files[0].lines, vec![Removed(1), Removed(2)]);
         assert_eq!(files[1].lines, vec![Removed(3), Added(3)]);
+    }
+
+    // Output reshaped by an option is refused rather than read into an empty result: `-R`
+    // swaps the prefixes, `--word-diff` drops the line prefixes (or, on an indented line,
+    // leaves a space that reads as context, so the hunk ends unchanged), and `--stat` has no
+    // file header at all.
+    #[test]
+    fn reshaped_output_is_unreadable() {
+        let file = "diff --git a/x.rs b/x.rs\nindex abc1234..def5678 100644\n";
+        let headers = format!("{file}--- a/x.rs\n+++ b/x.rs\n@@ -1 +1 @@\n");
+        let cases = [
+            (format!("{file}--- b/x.rs\n+++ a/x.rs\n"), "--- b/x.rs"),
+            (format!("{headers}x = [-1-]{{+2+}}\n"), "x = [-1-]{+2+}"),
+            (format!("{headers}    x = [-1-]{{+2+}}\n"), "@@ -1 +1 @@"),
+            (" x.rs | 2 +-\n".to_string(), " x.rs | 2 +-"),
+        ];
+        for (diff, at) in cases {
+            assert_eq!(parse_diff(&diff).err().map(|u| u.0).as_deref(), Some(at));
+        }
+    }
+
+    // A combined diff's file is skipped, not read as an option's reshaping; files around it
+    // are still read.
+    #[test]
+    fn combined_diff_files_are_skipped() {
+        let diff = "\
+diff --cc a.rs
+index 1111111,2222222..3333333
+--- a/a.rs
++++ b/a.rs
+@@@ -1,3 -1,3 +1,4 @@@
+  fn a() {
+--- x
+ -    let x = 2;
+++    if x > 1 {}
+diff --git a/b.rs b/b.rs
+index 1111111..2222222 100644
+--- a/b.rs
++++ b/b.rs
+@@ -1 +1 @@
+-old
++new
+";
+        let files = parse_diff(diff).unwrap();
+        let paths: Vec<_> = files.iter().map(|f| f.path()).collect();
+        assert_eq!(paths, vec!["b.rs"]);
+        assert_eq!(files[0].lines, vec![Removed(1), Added(1)]);
+        assert!(
+            parse_diff(&diff[..diff.find("diff --git").unwrap()])
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

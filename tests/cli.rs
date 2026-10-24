@@ -290,6 +290,27 @@ fn relative_is_refused_not_silently_empty() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// An option that reshapes git's output would read as a diff without symbols; it must fail
+// loudly instead.
+#[test]
+fn reshaping_options_are_refused_not_silently_empty() {
+    let dir = repo_with_alpha_edit("reshape", "a.rs");
+    for arg in ["-R", "--word-diff", "--stat"] {
+        let out = isolated(&mut Command::new(env!("CARGO_BIN_EXE_chsig")))
+            .arg(arg)
+            .current_dir(&dir)
+            .output()
+            .expect("spawn chsig");
+        assert!(!out.status.success(), "{arg} should fail");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("can't read git's diff output"),
+            "{arg}: stderr was:\n{err}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // Braces in a comment or string used to shift symbol ranges under brace counting; parsed,
 // they neither warn nor move the change off `beta`.
 #[test]
