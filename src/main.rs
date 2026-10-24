@@ -394,9 +394,9 @@ fn attribute_signals(
 
     let mut touched: Vec<SymbolSignals> = Vec::new();
     for changed in lines {
-        let (side, line, body, added) = match changed {
-            ChangedLine::Added { line, body } => (new, *line, body, true),
-            ChangedLine::Removed { line, body } => (old, *line, body, false),
+        let (side, line, added) = match *changed {
+            ChangedLine::Added(line) => (new, line, true),
+            ChangedLine::Removed(line) => (old, line, false),
         };
         let Some(def) = enclosing(&side.defs, line) else {
             continue;
@@ -421,7 +421,8 @@ fn attribute_signals(
         };
         let signals = &mut touched[i].signals;
         let sign = if added { 1 } else { -1 };
-        signals.branch_delta += sign * branch_tokens(body);
+        let branches = side.branches.iter().filter(|l| **l == line).count();
+        signals.branch_delta += sign * branches as i32;
         for (_, name) in side.calls.iter().filter(|(l, _)| *l == line) {
             let call = match signals.calls.iter().position(|c| c.name == *name) {
                 Some(j) => &mut signals.calls[j],
@@ -442,18 +443,6 @@ fn attribute_signals(
         }
     }
     touched
-}
-
-/// Rough count of branch tokens on a changed line (a fact, not a measure). Matched with
-/// trailing spaces / operators to avoid hitting identifiers; over- and under-counts a bit.
-fn branch_tokens(body: &str) -> i32 {
-    const TOKENS: [&str; 9] = [
-        "if ", "else", "switch", "case ", "match ", " => ", "&&", "||", "?.",
-    ];
-    TOKENS
-        .iter()
-        .map(|tok| body.matches(tok).count() as i32)
-        .sum()
 }
 
 #[cfg(test)]
@@ -483,19 +472,7 @@ mod tests {
         ));
     }
 
-    fn added(line: usize, body: &str) -> ChangedLine {
-        ChangedLine::Added {
-            line,
-            body: body.into(),
-        }
-    }
-
-    fn removed(line: usize, body: &str) -> ChangedLine {
-        ChangedLine::Removed {
-            line,
-            body: body.into(),
-        }
-    }
+    use ChangedLine::{Added, Removed};
 
     fn attribute(
         path: &str,
@@ -526,20 +503,17 @@ const Component = () => {
 }
 ";
         let old = "const Component = () => {\n  return null\n}\n";
-        let lines = [
-            added(3, "    if (something) {}"),
-            added(7, "    condition && <Child />"),
-        ];
+        let lines = [Added(3), Added(7)];
         let out = attribute("c.tsx", old, new, &lines);
         assert_eq!(out, vec![("Component".to_string(), 2, None)]);
     }
 
-    // A removed branch token subtracts: swapping `if x {}` for `if y {}` is net zero, not +2.
+    // A removed branch subtracts: swapping `if x {}` for `if y {}` is net zero, not +2.
     #[test]
-    fn removed_branch_tokens_subtract() {
+    fn removed_branches_subtract() {
         let old = "fn foo() {\n    if x {}\n}\n";
         let new = "fn foo() {\n    if y {}\n}\n";
-        let lines = [removed(2, "    if x {}"), added(2, "    if y {}")];
+        let lines = [Removed(2), Added(2)];
         let out = attribute("x.rs", old, new, &lines);
         assert_eq!(out, vec![("foo".to_string(), 0, None)]);
     }
@@ -558,7 +532,7 @@ fn beta() {
 }
 ";
         let old = new.replace("    if p && q {}\n", "");
-        let out = attribute("a.rs", &old, new, &[added(3, "    if p && q {}")]);
+        let out = attribute("a.rs", &old, new, &[Added(3)]);
         assert_eq!(out, vec![("alpha".to_string(), 2, None)]);
     }
 
@@ -568,11 +542,7 @@ fn beta() {
     fn a_deleted_function_is_shown_deleted_and_its_neighbor_untouched() {
         let old = "fn foo() {\n    if y {}\n}\nfn bar() {\n    let x = 1;\n}\n";
         let new = "fn bar() {\n    let x = 1;\n}\n";
-        let lines = [
-            removed(1, "fn foo() {"),
-            removed(2, "    if y {}"),
-            removed(3, "}"),
-        ];
+        let lines = [Removed(1), Removed(2), Removed(3)];
         let out = attribute("b.rs", old, new, &lines);
         assert_eq!(out, vec![("foo".to_string(), -1, Some(Status::Deleted))]);
     }
@@ -584,14 +554,14 @@ fn beta() {
         let old = "fn a() {}\nfn b() {\n    if x {}\n}\nfn gone() {}\n";
         let new = "fn b() {\n    if x {}\n}\nfn a() {}\nfn renamed() {}\n";
         let lines = [
-            added(1, "fn b() {"),
-            added(2, "    if x {}"),
-            added(3, "}"),
-            removed(2, "fn b() {"),
-            removed(3, "    if x {}"),
-            removed(4, "}"),
-            removed(5, "fn gone() {}"),
-            added(5, "fn renamed() {}"),
+            Added(1),
+            Added(2),
+            Added(3),
+            Removed(2),
+            Removed(3),
+            Removed(4),
+            Removed(5),
+            Added(5),
         ];
         let out = attribute("m.rs", old, new, &lines);
         assert_eq!(
@@ -621,10 +591,7 @@ impl B {
 }
 ";
         let old = "impl A {\n    fn new() {}\n}\nimpl B {\n    fn new() {}\n}\n";
-        let lines = [
-            added(3, "        if a {}"),
-            added(8, "        if b && c {}"),
-        ];
+        let lines = [Added(3), Added(8)];
         let out = attribute("n.rs", old, new, &lines);
         assert_eq!(
             out,
@@ -640,12 +607,7 @@ impl B {
     fn calls_carry_the_side_they_were_changed_on() {
         let old = "fn save() {\n    db.query(q);\n    log(a);\n}\n";
         let new = "fn save() {\n    tx.update(q);\n    log(b);\n}\n";
-        let lines = [
-            removed(2, "    db.query(q);"),
-            removed(3, "    log(a);"),
-            added(2, "    tx.update(q);"),
-            added(3, "    log(b);"),
-        ];
+        let lines = [Removed(2), Removed(3), Added(2), Added(3)];
         let parse = |src: &str| find_symbol_defs("s.rs", src);
         let out = attribute_signals(&parse(old), &parse(new), &lines);
         assert_eq!(out.len(), 1);
@@ -666,12 +628,6 @@ impl B {
         );
         assert_eq!(wrap("  calls: ", &items[..1], 24), vec!["  calls: +aaaa"]);
         assert!(wrap("  calls: ", &[], 24).is_empty());
-    }
-
-    #[test]
-    fn branch_tokens_are_substring_facts() {
-        assert_eq!(branch_tokens("if (a && b) {"), 2);
-        assert_eq!(branch_tokens("const x = 5"), 0);
     }
 
     #[test]

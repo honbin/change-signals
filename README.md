@@ -107,8 +107,10 @@ tool picks where to look, not what to conclude.
 - `calls` names callees syntactically and resolves nothing: `tx` is just the receiver's name,
   a receiver that is itself an expression (`(a + b).abs()`, a literal) shows as `*`, and a call
   through an expression (`fns[i]()`) is not listed.
-- `branch` is a crude substring count of branch tokens (`if`, `&&`, `?.`, ...) on changed
-  lines, strings and comments included.
+- `branch` is the net change in branch points on changed lines, read from the syntax tree:
+  `if` (an `else if` counts once), a final `else`, `case` / `default` / match arms, ternaries,
+  `&&` / `||` / `??`, and Rust's `let ... else`; loops are not counted. It counts syntax, not
+  paths through the code.
 - No risk score and no safe-to-skip verdict — it only points at where to read.
 
 The signals stay crude on purpose: making them precise means type resolution, which would

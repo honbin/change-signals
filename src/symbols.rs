@@ -24,6 +24,8 @@ pub(crate) struct SymbolDefs {
     /// (1-based line, callee) for every call in the file, placed on the line of the callee's
     /// name.
     pub(crate) calls: Vec<(usize, String)>,
+    /// 1-based line of each branch point, placed on the token that introduces it.
+    pub(crate) branches: Vec<usize>,
 }
 
 /// Named functions and methods with their spans, ascending by start, for the file's language.
@@ -52,10 +54,59 @@ pub(crate) fn find_symbol_defs(path: &str, source: &str) -> SymbolDefs {
     defs.sort_by_key(|d| d.start);
     let mut calls = Vec::new();
     collect_calls(tree.root_node(), source, &mut calls);
+    let mut branches = Vec::new();
+    collect_branches(tree.root_node(), &mut branches);
     SymbolDefs {
         defs,
         has_errors: tree.root_node().has_error(),
         calls,
+        branches,
+    }
+}
+
+/// Branch points: an `if` (an `else if` counts once, as its `if`), a final `else`, a `case`,
+/// `default` or match arm, a ternary, `&&` / `||` / `??`, and Rust's `let ... else`. Loops are not counted, `while
+/// let` included: a loop's condition decides whether to go on, not which way to go. Each point
+/// sits on the line of its own keyword or operator, so a changed line carries exactly the
+/// branches written on it, even when a formatter splits a condition across lines.
+fn collect_branches(node: Node, out: &mut Vec<usize>) {
+    // A let chain's `&&` (`if let Some(x) = a && b`) is a bare token of the chain, not a
+    // binary_expression.
+    if node.kind() == "let_chain" {
+        let mut cursor = node.walk();
+        out.extend(
+            node.children(&mut cursor)
+                .filter(|c| c.kind() == "&&")
+                .map(|c| c.start_position().row + 1),
+        );
+    }
+    let at = match node.kind() {
+        "if_statement" | "if_expression" | "switch_case" | "switch_default" | "match_arm" => {
+            Some(node)
+        }
+        "else_clause" => node
+            .named_child(0)
+            .filter(|body| !matches!(body.kind(), "if_statement" | "if_expression"))
+            .map(|_| node),
+        "ternary_expression" => {
+            let mut cursor = node.walk();
+            node.children(&mut cursor).find(|c| c.kind() == "?")
+        }
+        "binary_expression" => node
+            .child_by_field_name("operator")
+            .filter(|op| matches!(op.kind(), "&&" | "||" | "??")),
+        "let_declaration" => {
+            let mut cursor = node.walk();
+            node.children(&mut cursor).find(|c| c.kind() == "else")
+        }
+        _ => None,
+    };
+    if let Some(at) = at {
+        out.push(at.start_position().row + 1);
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_branches(child, out);
     }
 }
 
@@ -516,6 +567,59 @@ fn f() {
         assert_eq!(
             placed,
             vec![(3, "db.from".to_string()), (2, "db.select".to_string())]
+        );
+    }
+
+    fn branch_lines(path: &str, src: &str) -> Vec<usize> {
+        let mut lines = find_symbol_defs(path, src).branches;
+        lines.sort();
+        lines
+    }
+
+    // Arrow functions, optional chaining and branch words inside strings or comments are not
+    // branches; `else if` is one branch, not two.
+    #[test]
+    fn ts_branches_come_from_syntax() {
+        let src = "\
+const f = (x) => x?.y;
+if (a && b) {
+} else if (c) {
+} else {
+}
+const s = 'if (x) else';
+switch (k) { case 1: break; default: }
+const v = ok
+  ? 1
+  : d ?? 2;
+";
+        assert_eq!(branch_lines("a.ts", src), vec![2, 2, 3, 4, 7, 7, 9, 10]);
+    }
+
+    // A closure, a `while let` loop and branch words in a comment are not branches.
+    #[test]
+    fn rust_branches_come_from_syntax() {
+        let src = "\
+fn f() {
+    let g = |x| x;
+    if let Some(v) = o {
+    } else if a || b {
+    } else {
+    }
+    match k {
+        1 => {}
+        _ => {}
+    }
+    while let Some(x) = it.next() {}
+    let Some(y) = o
+        else { return };
+    // if match
+    if let Some(a) = o && a > 1
+        && let Ok(b) = r && (b > 0 || c) {}
+}
+";
+        assert_eq!(
+            branch_lines("a.rs", src),
+            vec![3, 4, 4, 5, 8, 9, 13, 15, 15, 16, 16, 16]
         );
     }
 

@@ -25,11 +25,11 @@ pub(crate) struct Side {
     pub(crate) blob: String,
 }
 
-/// A changed line with its body (without the `+`/`-`), numbered on the side it exists on.
+/// A changed line, numbered on the side it exists on.
 #[derive(Debug, PartialEq)]
 pub(crate) enum ChangedLine {
-    Added { line: usize, body: String },
-    Removed { line: usize, body: String },
+    Added(usize),
+    Removed(usize),
 }
 
 pub(crate) fn parse_diff(diff: &str) -> Vec<ChangedFile> {
@@ -55,20 +55,14 @@ pub(crate) fn parse_diff(diff: &str) -> Vec<ChangedFile> {
                 match first {
                     Some(b'+') => {
                         if let Some(lines) = lines {
-                            lines.push(ChangedLine::Added {
-                                line: new_line,
-                                body: line[1..].to_string(),
-                            });
+                            lines.push(ChangedLine::Added(new_line));
                         }
                         new_line += 1;
                         new_rem = new_rem.saturating_sub(1);
                     }
                     Some(b'-') => {
                         if let Some(lines) = lines {
-                            lines.push(ChangedLine::Removed {
-                                line: old_line,
-                                body: line[1..].to_string(),
-                            });
+                            lines.push(ChangedLine::Removed(old_line));
                         }
                         old_line += 1;
                         old_rem = old_rem.saturating_sub(1);
@@ -194,19 +188,7 @@ fn parse_hunk_header(rest: &str) -> Option<HunkHeader> {
 mod tests {
     use super::*;
 
-    fn added(line: usize, body: &str) -> ChangedLine {
-        ChangedLine::Added {
-            line,
-            body: body.into(),
-        }
-    }
-
-    fn removed(line: usize, body: &str) -> ChangedLine {
-        ChangedLine::Removed {
-            line,
-            body: body.into(),
-        }
-    }
+    use ChangedLine::{Added, Removed};
 
     #[test]
     fn parse_diff_numbers_each_line_on_its_own_side() {
@@ -232,13 +214,7 @@ index abc1234..def5678 100644
         assert_eq!(f.new.as_ref().map(|s| s.blob.as_str()), Some("def5678"));
         assert_eq!(
             f.lines,
-            vec![
-                removed(11, "old1"),
-                removed(12, "old2"),
-                added(21, "new1"),
-                added(22, "new2"),
-                added(23, "new3"),
-            ]
+            vec![Removed(11), Removed(12), Added(21), Added(22), Added(23),]
         );
     }
 
@@ -268,14 +244,7 @@ index 1111111..2222222 100644
 ";
         let files = parse_diff(diff);
         assert_eq!(files.len(), 2);
-        assert_eq!(
-            files[0].lines,
-            vec![
-                removed(2, "-- a sql comment"),
-                added(2, "++n;"),
-                added(3, "if y {}"),
-            ]
-        );
+        assert_eq!(files[0].lines, vec![Removed(2), Added(2), Added(3),]);
         assert_eq!(files[1].path(), "y.rs");
         assert_eq!(files[1].lines.len(), 2);
     }
@@ -288,7 +257,7 @@ index 1111111..2222222 100644
         let files = parse_diff(diff);
         assert_eq!(files[0].path(), "s p.rs");
         assert_eq!(files[0].old.as_ref().unwrap().path, "s p.rs");
-        assert_eq!(files[0].lines, vec![added(3, "x")]);
+        assert_eq!(files[0].lines, vec![Added(3)]);
     }
 
     // A deleted file has only an old side and an added one only a new side; a rename keeps
@@ -341,11 +310,8 @@ index 0000000..3333333
                 (None, Some("born.rs"), "born.rs"),
             ]
         );
-        assert_eq!(
-            files[0].lines,
-            vec![removed(1, "fn a() {"), removed(2, "}")]
-        );
-        assert_eq!(files[1].lines, vec![removed(3, "x"), added(3, "y")]);
+        assert_eq!(files[0].lines, vec![Removed(1), Removed(2)]);
+        assert_eq!(files[1].lines, vec![Removed(3), Added(3)]);
     }
 
     #[test]
