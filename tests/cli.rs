@@ -404,3 +404,49 @@ fn an_attribute_only_change_shows_its_function() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// Retargeting a symlink changes the link's own text in the diff, while reading the path
+// reaches the target's content; the mismatch is caught instead of reporting the target's
+// functions as new.
+#[cfg(unix)]
+#[test]
+fn a_retargeted_symlink_is_skipped_with_a_notice() {
+    let dir = temp_repo("symlink");
+    std::fs::write(dir.join("ta.rs"), "fn a() {}\n").unwrap();
+    std::fs::write(dir.join("tb.rs"), "fn x() {}\n").unwrap();
+    std::os::unix::fs::symlink("ta.rs", dir.join("link.rs")).unwrap();
+    git(&dir, &["add", "-A"]);
+    git(&dir, &["commit", "-qm", "init"]);
+    std::fs::remove_file(dir.join("link.rs")).unwrap();
+    std::os::unix::fs::symlink("tb.rs", dir.join("link.rs")).unwrap();
+    let (out, err) = chsig_full(&dir, &[]);
+    assert_eq!(out, "");
+    assert_eq!(
+        err,
+        "chsig: link.rs in the working tree is not the diff's new side; skipping\n"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// The check hashes with git's filters, as the diff did: a CRLF working file under
+// core.autocrlf matches its LF blob and is read.
+#[test]
+fn a_filtered_working_file_still_matches_the_diff() {
+    let dir = temp_repo("autocrlf");
+    git(&dir, &["config", "core.autocrlf", "true"]);
+    std::fs::write(dir.join("a.rs"), "fn alpha() {\r\n    x();\r\n}\r\n").unwrap();
+    git(&dir, &["add", "a.rs"]);
+    git(&dir, &["commit", "-qm", "init"]);
+    std::fs::write(
+        dir.join("a.rs"),
+        "fn alpha() {\r\n    x();\r\n    y();\r\n}\r\n",
+    )
+    .unwrap();
+    let (out, err) = chsig_full(&dir, &[]);
+    assert_eq!(
+        out,
+        "a.rs\n  alpha                        refs=1\n      calls: +y\n\n"
+    );
+    assert_eq!(err, "");
+    let _ = std::fs::remove_dir_all(&dir);
+}

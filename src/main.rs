@@ -8,7 +8,7 @@
 //! downstream of this tool.
 
 use std::io::{self, Write};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use diff::{ChangedFile, ChangedLine, Side, parse_diff};
 use symbols::{SymbolDef, SymbolDefs, find_symbol_defs};
@@ -265,24 +265,28 @@ fn collect_symbols(root: &str, file: &ChangedFile, side: SourceSide) -> Vec<Symb
     if !sides.clone().any(|s| symbols::is_supported(&s.path)) {
         return Vec::new(); // don't read sources that would be discarded
     }
-    let old = match &file.old {
-        None => SymbolDefs::default(),
-        Some(old) => {
-            let Some(source) = read_blob(old, "old") else {
-                return Vec::new();
-            };
-            parse_side(old, &source, " (old side)")
-        }
+    // Read both sides before parsing either, so a skipped file reports only why it was skipped.
+    let old_source = match &file.old {
+        None => None,
+        Some(old) => match read_blob(old, "old") {
+            Some(source) => Some((old, source)),
+            None => return Vec::new(),
+        },
     };
-    let new = match &file.new {
-        None => SymbolDefs::default(),
-        Some(new) => {
-            let Some(source) = read_new_side(root, new, side) else {
-                return Vec::new();
-            };
-            parse_side(new, &source, "")
-        }
+    let new_source = match &file.new {
+        None => None,
+        Some(new) => match read_new_side(root, new, side) {
+            Some(source) => Some((new, source)),
+            None => return Vec::new(),
+        },
     };
+    let parse = |read: Option<(&Side, String)>, label| {
+        read.map_or_else(SymbolDefs::default, |(side, source)| {
+            parse_side(side, &source, label)
+        })
+    };
+    let old = parse(old_source, " (old side)");
+    let new = parse(new_source, "");
     let mut symbols = attribute_signals(&old, &new, &file.lines);
     for sym in &mut symbols {
         sym.signals.refs = sym.ident.as_deref().and_then(|i| ref_line_count(root, i));
@@ -347,18 +351,48 @@ fn source_side(args: &[String]) -> SourceSide {
 /// Invalid UTF-8 is replaced, as for a blob, since it doesn't move line breaks.
 fn read_new_side(root: &str, new: &Side, side: SourceSide) -> Option<String> {
     match side {
-        SourceSide::Worktree => match std::fs::read(format!("{root}/{}", new.path)) {
-            Ok(bytes) => Some(String::from_utf8_lossy(&bytes).into_owned()),
-            Err(e) => {
-                eprintln!(
-                    "chsig: could not read {} from the working tree ({e}); skipping",
-                    new.path
-                );
-                None
-            }
-        },
+        SourceSide::Worktree => read_working_file(root, new),
         SourceSide::Blob => read_blob(new, "new"),
     }
+}
+
+/// Read a working file only if it is the content the diff's new side describes: the source
+/// side is inferred from the arguments, and even when that is right, reading the path can
+/// reach other content (a symlink's target, where the diff shows the link). The bytes read are
+/// the bytes hashed, with git's filters for the path applied as they were for the diff's blob,
+/// so a save in between can't slip unchecked content into the parse.
+fn read_working_file(root: &str, new: &Side) -> Option<String> {
+    let skip = |why: &str| {
+        eprintln!("chsig: {} in the working tree {why}; skipping", new.path);
+        None
+    };
+    let bytes = match std::fs::read(format!("{root}/{}", new.path)) {
+        Ok(bytes) => bytes,
+        Err(e) => return skip(&format!("could not be read ({e})")),
+    };
+    match hash_with_filters(root, &new.path, &bytes) {
+        None => skip("could not be hashed"),
+        Some(sha) if !sha.starts_with(&new.blob) => skip("is not the diff's new side"),
+        Some(_) => Some(String::from_utf8_lossy(&bytes).into_owned()),
+    }
+}
+
+fn hash_with_filters(root: &str, path: &str, bytes: &[u8]) -> Option<String> {
+    let mut child = Command::new("git")
+        .args(["hash-object", "--stdin", &format!("--path={path}")])
+        .current_dir(root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    // hash-object reads all of stdin before writing its one line, so writing first can't
+    // deadlock on a full output pipe.
+    child.stdin.take()?.write_all(bytes).ok()?;
+    let out = child.wait_with_output().ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
 fn read_blob(side: &Side, label: &str) -> Option<String> {

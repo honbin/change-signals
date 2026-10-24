@@ -103,6 +103,9 @@ tool picks where to look, not what to conclude.
   grammar does not read `import('...')` types inside type arguments (e.g.
   `importOriginal<typeof import('x')>()`), nor call signatures in an interface or type
   literal separated only by newlines.
+- A working file is read only if it hashes (with git's filters) to the diff's new-side blob;
+  otherwise it is skipped with a notice, as for a retargeted symlink. A filter that swaps the
+  whole content, such as Git LFS, still passes the check while the diff describes the pointer.
 - `refs` is `git grep`-based (tracked files across the whole repo, as in the working tree),
   matching the bare name, not resolved references.
 - `calls` names callees syntactically and resolves nothing: `tx` is just the receiver's name,
