@@ -10,21 +10,18 @@
 use std::io::{self, Write};
 use std::process::Command;
 
+use tree_sitter::{Language, Node, Parser};
+
 // ---- tunables tied to the target codebase ----------------------------------
 //
 // Everything here encodes assumptions about the repo chsig is pointed at — its stack
-// (react-query, SQL) and its shape (React hooks nest one level deep). This is the one
-// project-specific seam; the rest of the file is general. Edit these to retarget.
+// (react-query, SQL). This is the one project-specific seam; the rest of the file is
+// general. Edit these to retarget.
 //
 // Kept as plain consts, not an external config file: with a single consumer there is no
 // second data point to design a schema from. Promote to real config (env/flag, then a
 // file) when a second repo actually needs different values — that is when the varying
 // axis becomes known. Until then this block *is* the example.
-
-/// Max brace depth at which a line still counts as a symbol definition. 0 = top level,
-/// 1 = a method or hook-level binding (`const f = useCallback(...)`); deeper locals are
-/// dropped. Tuned to one-level React hook nesting.
-const MAX_DEF_DEPTH: i32 = 1;
 
 /// Boundary vocabulary: substrings that tag a changed line as touching a known boundary.
 /// A marker, not a risk score. "query" is deliberately absent — on the FE it fires on
@@ -317,12 +314,15 @@ fn parse_hunk_header(rest: &str) -> Option<HunkHeader> {
 
 struct SymbolSignals {
     name: String,
+    /// The bare identifier `refs` greps for; `name` may carry an owner (`Foo::new`).
+    ident: Option<String>,
     signals: Signals,
 }
 
 #[derive(Default)]
 struct Signals {
-    /// `None` = refs could not be measured (shown as `refs=?`), distinct from `Some(0)`.
+    /// `None` = refs could not be measured, or the symbol has no name to grep for (an anonymous
+    /// `export default`); shown as `refs=?`, distinct from `Some(0)`.
     refs: Option<usize>,
     branch_delta: i32,
     boundaries: Vec<&'static str>,
@@ -354,15 +354,15 @@ fn collect_symbols(root: &str, file: &ChangedFile, side: SourceSide) -> Vec<Symb
         return Vec::new(); // deleted, binary, unreadable, or new side absent in the chosen source
     };
     let parsed = find_symbol_defs(&file.path, &source);
-    if !parsed.balanced {
+    if parsed.has_errors {
         eprintln!(
-            "chsig: unbalanced braces in {}; symbol ranges may be off",
+            "chsig: parse errors in {}; symbol ranges may be off",
             file.path
         );
     }
     let mut symbols = attribute_signals(&parsed.defs, file);
     for sym in &mut symbols {
-        sym.signals.refs = ref_line_count(root, &sym.name);
+        sym.signals.refs = sym.ident.as_deref().and_then(|i| ref_line_count(root, i));
     }
     symbols
 }
@@ -436,10 +436,9 @@ fn read_new_side(root: &str, file: &ChangedFile, side: SourceSide) -> Option<Str
 /// Attribute changed lines to enclosing symbols, in first-seen order. Pure (no git, no disk)
 /// so the attribution — the part that just got the target wrong — is directly testable.
 ///
-/// A changed line goes to the *innermost* def whose `[start, end]` body contains it (greatest
-/// start among containing defs). A line outside every handler body but inside the component
-/// thus lands on the component, not on the last handler above it. refs is left `None` for the
-/// caller to measure.
+/// A changed line goes to the def whose `[start, end]` span contains it. Spans don't nest
+/// (`find_symbol_defs` keeps only outermost defs) but can share a line (`fn a() {} fn b() {}`),
+/// where the later def wins. refs is left `None` for the caller to measure.
 ///
 /// Signals aggregate per def, not per name: two `fn new` in different impls of one file stay
 /// two rows rather than summing into one.
@@ -478,6 +477,7 @@ fn attribute_signals(defs: &[SymbolDef], file: &ChangedFile) -> Vec<SymbolSignal
         .into_iter()
         .map(|(def, signals)| SymbolSignals {
             name: defs[def].name.clone(),
+            ident: defs[def].ident.clone(),
             signals,
         })
         .collect()
@@ -487,151 +487,216 @@ fn attribute_signals(defs: &[SymbolDef], file: &ChangedFile) -> Vec<SymbolSignal
 /// we must know where the body *ends*, or trailing code (a component's JSX return, module
 /// tail) wrongly folds into the last preceding def even when that def never changed.
 struct SymbolDef {
+    /// Shown name: the identifier, qualified by its owner when it has one (`Foo::new`,
+    /// `Client.fetch`), so same-named methods in one file stay distinguishable.
     name: String,
+    /// `None` for an anonymous `export default`, shown as `default`, which is no identifier.
+    ident: Option<String>,
     start: usize, // 1-based def line
     end: usize,   // 1-based line where the body closes (== start for a one-liner)
-    depth: i32,   // brace depth at the start of the def line
 }
 
 struct SymbolDefs {
     defs: Vec<SymbolDef>,
-    /// False when depth went below 0 or didn't return to 0 at EOF — spans may then be off.
-    /// A miscount that cancels out (a stray `{` and `}`) still passes as balanced.
-    balanced: bool,
+    /// The parser recovered from syntax it could not read; spans around it may be off.
+    has_errors: bool,
 }
 
-/// Definitions with body spans, ascending by start, for the file's language.
+/// Named functions and methods with their spans, ascending by start, for the file's language.
 ///
-/// Only Rust and TS/JS are parsed; any other extension returns empty rather than being
-/// run through a parser that doesn't fit it (don't treat unsupported files as supported).
-/// Tracks brace nesting: a line is a def only if its depth *at the start of the line*
-/// (before this line's braces) is <= MAX_DEF_DEPTH (0 = top level, 1 = a method / hook-level
-/// binding; deeper local bindings like `const outcome = ...` are dropped). The same depth
-/// counter gives each def's `end` — the line where depth returns to the def's level — so a
-/// change outside a def's body attributes to the enclosing def, not to this one. Brace
-/// counting is off inside strings/comments (accepted noise, surfaced via `balanced`); no
-/// lexer, no tree-sitter — a line-local strip of literals was measured to break more files
-/// than it fixed.
+/// Only Rust and TS/JS are parsed; any other extension returns empty rather than being run
+/// through a grammar that doesn't fit it. JS is read with the TSX grammar, which also covers
+/// JSX in `.js`.
+///
+/// Only the outermost named function is a symbol: a named function inside another one
+/// (a component's `handleClick`, a local helper) is not, and its changes attribute to the
+/// enclosing function. Listing inner ones mislabels changes with local names that a reader
+/// can't locate; the cost is that a component's handlers no longer show separately.
 fn find_symbol_defs(path: &str, source: &str) -> SymbolDefs {
-    let def: fn(&str) -> Option<String> = match path.rsplit_once('.').map(|(_, ext)| ext) {
-        Some("rs") => rust_def,
-        Some("ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs") => ts_def,
+    let (language, lang): (Language, Lang) = match path.rsplit_once('.').map(|(_, ext)| ext) {
+        Some("rs") => (tree_sitter_rust::LANGUAGE.into(), Lang::Rust),
+        Some("ts" | "mts" | "cts") => {
+            (tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(), Lang::Ts)
+        }
+        Some("tsx" | "js" | "jsx" | "mjs" | "cjs") => {
+            (tree_sitter_typescript::LANGUAGE_TSX.into(), Lang::Ts)
+        }
         _ => {
             return SymbolDefs {
                 defs: Vec::new(),
-                balanced: true,
+                has_errors: false,
             };
         }
     };
-    let mut balanced = true;
-    let mut finalized: Vec<SymbolDef> = Vec::new();
-    let mut open: Vec<SymbolDef> = Vec::new(); // defs whose body has not closed yet
-    let mut depth: i32 = 0;
-    for (i, line) in source.lines().enumerate() {
-        let line_no = i + 1;
-        if depth <= MAX_DEF_DEPTH
-            && let Some(name) = def(line)
-        {
-            open.push(SymbolDef {
-                name,
-                start: line_no,
-                end: line_no,
-                depth,
-            });
-        }
-        depth += brace_delta(line);
-        if depth < 0 {
-            balanced = false;
-            depth = 0;
-        }
-        // A def closes once depth returns to (or below) its own level. A one-liner closes on
-        // its own line; a brace def closes at the matching `}`.
-        while let Some(mut done) = open.pop_if(|top| depth <= top.depth) {
-            done.end = line_no;
-            finalized.push(done);
-        }
-    }
-    // Unbalanced braces (EOF inside a body): close the rest at the last line.
-    if depth != 0 {
-        balanced = false;
-    }
-    let last = source.lines().count();
-    for mut d in open.drain(..) {
-        d.end = last;
-        finalized.push(d);
-    }
-    finalized.sort_by_key(|d| d.start);
+    let mut parser = Parser::new();
+    parser
+        .set_language(&language)
+        .expect("grammar built for this tree-sitter version");
+    let tree = parser
+        .parse(source, None)
+        .expect("parse without a timeout or cancellation returns a tree");
+    let mut defs = Vec::new();
+    collect_defs(tree.root_node(), source, lang, None, &mut defs);
+    defs.sort_by_key(|d| d.start);
     SymbolDefs {
-        defs: finalized,
-        balanced,
+        defs,
+        has_errors: tree.root_node().has_error(),
     }
 }
 
-fn brace_delta(line: &str) -> i32 {
-    line.matches('{').count() as i32 - line.matches('}').count() as i32
+#[derive(Clone, Copy)]
+enum Lang {
+    Rust,
+    Ts,
 }
 
-fn rust_def(line: &str) -> Option<String> {
-    let mut t = line.trim_start();
-    for p in ["pub(crate) ", "pub ", "async ", "const ", "unsafe "] {
-        t = t.strip_prefix(p).unwrap_or(t);
-    }
-    let rest = t.strip_prefix("fn ")?;
-    let name = take_ident(rest);
-    (!name.is_empty()).then_some(name)
-}
-
-fn ts_def(line: &str) -> Option<String> {
-    let mut t = line.trim_start();
-    for p in ["export ", "default "] {
-        t = t.strip_prefix(p).unwrap_or(t);
-    }
-    for p in ["async function ", "function "] {
-        if let Some(rest) = t.strip_prefix(p) {
-            let name = take_ident(rest);
-            return (!name.is_empty()).then_some(name);
+impl Lang {
+    fn owner_sep(self) -> &'static str {
+        match self {
+            Lang::Rust => "::",
+            Lang::Ts => ".",
         }
     }
-    // Treat `const/let NAME = <function-ish>` as a symbol; skip scalar constants.
-    for p in ["const ", "let ", "var "] {
-        if let Some(rest) = t.strip_prefix(p) {
-            let name = take_ident(rest);
-            if name.is_empty() {
-                continue;
+}
+
+/// Walk `node`, recording each named function and not descending into it. `owner` is the
+/// name of the nearest enclosing impl, trait, class, or bound object literal.
+fn collect_defs(node: Node, src: &str, lang: Lang, owner: Option<&str>, out: &mut Vec<SymbolDef>) {
+    let qualify = |name: &str| match owner {
+        Some(o) => format!("{o}{}{name}", lang.owner_sep()),
+        None => name.to_string(),
+    };
+    if let Some(def) = def_name(node, src, lang) {
+        let ident = match def {
+            DefName::Ident(i) => Some(i),
+            DefName::AnonymousDefault => None,
+        };
+        out.push(SymbolDef {
+            name: qualify(ident.as_deref().unwrap_or("default")),
+            ident,
+            start: node.start_position().row + 1,
+            end: node.end_position().row + 1,
+        });
+        return;
+    }
+    // Owners nest: a method in `const api = { users: { list() {} } }` is `api.users.list`.
+    let own = owner_name(node, src, lang).map(|o| qualify(&o));
+    let owner = own.as_deref().or(owner);
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_defs(child, src, lang, owner, out);
+    }
+}
+
+fn text<'a>(node: Node, src: &'a str) -> &'a str {
+    &src[node.byte_range()]
+}
+
+/// A property name as written, without the quotes of a string key (`'on-open'() {}`).
+fn key_text<'a>(node: Node, src: &'a str) -> &'a str {
+    text(node, src).trim_matches(['\'', '"'])
+}
+
+enum DefName {
+    Ident(String),
+    AnonymousDefault,
+}
+
+fn def_name(node: Node, src: &str, lang: Lang) -> Option<DefName> {
+    let field_text = |field: &str| node.child_by_field_name(field).map(|n| key_text(n, src));
+    let value_binds_function = || binds_function(node.child_by_field_name("value"));
+    let ident = match (lang, node.kind()) {
+        (Lang::Rust, "function_item" | "function_signature_item") => field_text("name"),
+        (
+            Lang::Ts,
+            "function_declaration"
+            | "generator_function_declaration"
+            | "function_signature"
+            | "method_definition"
+            | "abstract_method_signature",
+        ) => field_text("name"),
+        // A body-less method in a class is an overload or a `declare class` member; elsewhere
+        // (interfaces, object types) it is a type, not a definition.
+        (Lang::Ts, "method_signature")
+            if node.parent().is_some_and(|p| p.kind() == "class_body") =>
+        {
+            field_text("name")
+        }
+        (Lang::Ts, "variable_declarator") => node
+            .child_by_field_name("name")
+            .filter(|n| n.kind() == "identifier")
+            .filter(|_| value_binds_function())
+            .map(|n| text(n, src)),
+        (Lang::Ts, "public_field_definition") => {
+            field_text("name").filter(|_| value_binds_function())
+        }
+        (Lang::Ts, "pair") => field_text("key").filter(|_| value_binds_function()),
+        // `export default function () {}`, `export default makeHandler(async () => {})`:
+        // bound, but to no name.
+        (Lang::Ts, "export_statement") if value_binds_function() => {
+            return Some(DefName::AnonymousDefault);
+        }
+        _ => None,
+    }?;
+    (!ident.is_empty()).then(|| DefName::Ident(ident.to_string()))
+}
+
+/// Whether a binding's value is a function, or a call handed a function (`memo(() => ...)`,
+/// `useCallback(...)`), which is named only by the binding. A call without one
+/// (`useQuery({...})`) is a value, not a symbol.
+fn binds_function(value: Option<Node>) -> bool {
+    let is_fn = |n: Node| {
+        matches!(
+            n.kind(),
+            "arrow_function" | "function_expression" | "generator_function"
+        )
+    };
+    let Some(value) = value else {
+        return false;
+    };
+    if is_fn(value) {
+        return true;
+    }
+    let Some(args) = value
+        .child_by_field_name("arguments")
+        .filter(|_| value.kind() == "call_expression")
+    else {
+        return false;
+    };
+    let mut cursor = args.walk();
+    args.named_children(&mut cursor).any(is_fn)
+}
+
+/// The name `node` lends to the defs inside it: the type of an `impl`, a trait, a class, or the
+/// variable or key an object literal is bound to.
+fn owner_name(node: Node, src: &str, lang: Lang) -> Option<String> {
+    let name = match (lang, node.kind()) {
+        (Lang::Rust, "impl_item") => {
+            // `impl<T> Foo<T>` and `impl Clone for &Foo` are owned by `Foo`.
+            let mut ty = node.child_by_field_name("type")?;
+            while matches!(ty.kind(), "generic_type" | "reference_type") {
+                ty = ty.child_by_field_name("type")?;
             }
-            let after = rest[name.len()..].trim_start();
-            // A type annotation may sit between the name and the assignment:
-            //   const Foo: React.FC<Props> = (...) => {
-            // Skip it to the ` = ` without parsing the type (no generics handling — if that
-            // ever feels needed, it's the sign to stop, not to build a type parser).
-            let rhs = if let Some(rhs) = after.strip_prefix('=') {
-                rhs
-            } else if after.starts_with(':') {
-                match after.split_once(" = ") {
-                    Some((_, rhs)) => rhs,
-                    None => continue,
+            text(ty, src)
+        }
+        (Lang::Rust, "trait_item")
+        | (Lang::Ts, "class_declaration" | "abstract_class_declaration" | "class") => {
+            text(node.child_by_field_name("name")?, src)
+        }
+        (Lang::Ts, "object") => {
+            let parent = node.parent()?;
+            match parent.kind() {
+                "variable_declarator" => {
+                    let name = parent.child_by_field_name("name")?;
+                    (name.kind() == "identifier").then(|| text(name, src))?
                 }
-            } else {
-                continue;
-            };
-            let rhs = rhs.trim_start();
-            let looks_fn = rhs.contains("=>")
-                || rhs.starts_with("function")
-                || rhs.starts_with("async")
-                || rhs.ends_with('(')
-                || rhs.ends_with('{');
-            if looks_fn {
-                return Some(name);
+                "pair" => key_text(parent.child_by_field_name("key")?, src),
+                _ => return None,
             }
         }
-    }
-    None
-}
-
-fn take_ident(s: &str) -> String {
-    s.chars()
-        .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$')
-        .collect()
+        _ => return None,
+    };
+    Some(name.to_string())
 }
 
 /// Rough count of branch tokens on a changed line (a fact, not a measure). Matched with
@@ -666,8 +731,8 @@ fn boundary_tags(body: &str) -> Vec<&'static str> {
 mod tests {
     use super::*;
 
-    // Tests pin *current* heuristic behavior as a regression anchor — including known
-    // over-captures — so later tuning can't silently drift. I/O fns (git_*,
+    // Tests pin *current* behavior as a regression anchor — including known defects — so
+    // later tuning can't silently drift. I/O fns (git_*,
     // ref_line_count, collect_symbols) are left to integration; not exercised here.
 
     #[test]
@@ -708,11 +773,10 @@ mod tests {
             .collect()
     }
 
-    // A change in a component's JSX return, below a prior handler's body, must attribute to the
-    // component — not to the handler that is merely the last def above it. Without body-span
-    // tracking the handler absorbed branch deltas from unrelated JSX it never contained.
+    // A change in a component's JSX return, below a handler's body, must attribute to the
+    // component. The handler is nested in it, so it is not a symbol of its own either.
     #[test]
-    fn change_outside_handler_body_attributes_to_enclosing_component() {
+    fn change_in_component_attributes_to_the_component_not_a_handler() {
         let source = "\
 const Component = () => {
   const handleClick = () => {
@@ -724,15 +788,16 @@ const Component = () => {
   )
 }
 ";
-        // Line 7 is `condition && <Child />`, inside the component return, outside the handler.
         let file = ChangedFile {
             path: "c.tsx".into(),
             new_blob: None,
-            changed_bodies: vec![(7, 1, "    condition && <Child />".into())],
+            changed_bodies: vec![
+                (3, 1, "    if (something) {}".into()),
+                (7, 1, "    condition && <Child />".into()),
+            ],
         };
         let out = attribute(source, "c.tsx", &file);
-        assert_eq!(out, vec![("Component".to_string(), 1, vec![])]);
-        assert!(!out.iter().any(|(n, _, _)| n == "handleClick"));
+        assert_eq!(out, vec![("Component".to_string(), 2, vec![])]);
     }
 
     // A removed branch token subtracts: swapping `if true {}` for `if false {}` is net zero,
@@ -756,12 +821,10 @@ fn foo() {
         assert_eq!(out, vec![("foo".to_string(), 0, vec![])]);
     }
 
-    // KNOWN DEFECT, pinned as current behavior — not endorsed. `brace_delta` counts a `}` inside a
-    // string literal, so the `}` on line 2 closes `alpha` early; the real change on line 3 then
-    // falls outside every def and is dropped silently instead of pointing at alpha. A fix should
-    // flip this to `[("alpha", 1, [])]`.
+    // A `}` inside a string used to close `alpha` early under brace counting, dropping the
+    // change below it.
     #[test]
-    fn stray_brace_in_string_closes_symbol_early_and_drops_change() {
+    fn brace_in_string_does_not_end_the_symbol() {
         let source = "\
 fn alpha() {
     let s = \"}\";
@@ -771,19 +834,13 @@ fn beta() {
     let x = 1;
 }
 ";
-        // Span check documents the early close: alpha's body is truncated at line 2.
-        let defs = find_symbol_defs("a.rs", source).defs;
-        let alpha = defs.iter().find(|d| d.name == "alpha").unwrap();
-        assert_eq!((alpha.start, alpha.end), (1, 2)); // true body is lines 1..=4
-
-        // The real change on line 3 is inside alpha's *true* body but outside the truncated span.
         let file = ChangedFile {
             path: "a.rs".into(),
             new_blob: None,
             changed_bodies: vec![(3, 1, "    if p && q {}".into())],
         };
         let out = attribute(source, "a.rs", &file);
-        assert!(out.is_empty()); // DEFECT: silently dropped; should be [("alpha", 1, [])]
+        assert_eq!(out, vec![("alpha".to_string(), 2, vec![])]);
     }
 
     // KNOWN DEFECT, pinned as current behavior — not endorsed. A symbol deleted above `bar` has no
@@ -811,9 +868,33 @@ fn bar() {
         assert_eq!(out, vec![("bar".to_string(), -1, vec![])]); // DEFECT: bar was not changed
     }
 
+    // rustfmt and prettier break long signatures across lines, so the body opens on a later
+    // line. Brace counting closed such a def on its first line and dropped its whole body.
     #[test]
-    fn brace_depth_drops_deeper_locals_keeps_hook_level() {
-        // Depth 0 (top level) and 1 (hook-level binding) are symbols; depth 2+ is not.
+    fn multi_line_signature_keeps_its_body() {
+        let rs = "\
+fn list_line(
+    entry: &Entry,
+) -> Line {
+    if x {}
+}
+";
+        let ts = "\
+export function createWidget(
+  options: Options,
+): Widget {
+  if (x) {}
+}
+";
+        for (path, src) in [("a.rs", rs), ("a.ts", ts)] {
+            let defs = find_symbol_defs(path, src).defs;
+            assert_eq!(defs.len(), 1, "{path}");
+            assert_eq!((defs[0].start, defs[0].end), (1, 5), "{path}");
+        }
+    }
+
+    #[test]
+    fn nested_named_functions_fold_into_the_outermost() {
         let src = "\
 export const useThing = () => {
   const handleClick = useCallback((x) => {
@@ -824,67 +905,145 @@ export const useThing = () => {
 }
 export const makeRequest = () => new Req()
 ";
-        assert_eq!(
-            names("hook.ts", src),
-            vec!["useThing", "handleClick", "makeRequest"],
-        );
+        assert_eq!(names("hook.ts", src), vec!["useThing", "makeRequest"]);
     }
 
-    // Both miscount directions are flagged: a `{` in a comment leaves depth open at EOF, a
-    // `}` in a string drives it below 0. Literal braces that cancel out are not detectable.
     #[test]
-    fn balance_flags_both_miscount_directions() {
-        let b = |src: &str| find_symbol_defs("a.rs", src).balanced;
-        assert!(b("fn a() {\n    let x = 1;\n}\n"));
-        assert!(!b("fn a() {\n    // {\n}\n"));
-        assert!(!b("fn a() {\n    let s = \"}\";\n}\n"));
-        assert!(b("fn a() {\n    let s = \"{}\";\n}\n"));
+    fn syntax_errors_are_flagged() {
+        let e = |src: &str| find_symbol_defs("a.rs", src).has_errors;
+        assert!(!e("fn a() {\n    let s = \"{\";\n}\n"));
+        assert!(e("fn a( {\n}\n"));
+    }
+
+    // `default` is a placeholder, not a name: grepping it would count every `default` in the
+    // repo as this symbol's refs.
+    #[test]
+    fn anonymous_default_export_has_no_identifier() {
+        let defs =
+            find_symbol_defs("a.ts", "export default () => {};\nexport function f() {}\n").defs;
+        let got: Vec<_> = defs
+            .iter()
+            .map(|d| (d.name.as_str(), d.ident.as_deref()))
+            .collect();
+        assert_eq!(got, vec![("default", None), ("f", Some("f"))]);
     }
 
     #[test]
     fn unsupported_language_has_no_symbols() {
-        // A .go file must not be run through the TS/JS parser (would accidentally match).
+        // A .go file must not be run through another language's grammar.
         let src = "var f = func() {";
         assert!(find_symbol_defs("main.go", src).defs.is_empty());
     }
 
     #[test]
-    fn rust_defs_and_impl_methods() {
+    fn rust_symbols_are_fns_and_methods_named_by_owner() {
         let src = "\
-pub fn alpha() {
+pub fn alpha() {}
+pub(super) fn beta() {}
+const unsafe extern \"C\" fn gamma() {}
+struct S { x: u8 }
+impl Clone for &Bar {
+    fn clone(&self) -> Self {}
 }
-impl Foo {
-    pub async fn method(&self) {}
+impl<T> Foo<T> {
+    pub async fn method(&self) {
+        fn helper() {}
+        let f = |x| x;
+    }
+}
+trait Run {
+    fn run(&self);
+    fn twice(&self) {}
+}
+mod tests {
+    impl Bar {
+        fn new() {}
+    }
+    #[test]
+    fn it_works() {}
 }
 ";
-        // `impl Foo` is not a symbol; the top-level fn and the depth-1 method are.
-        assert_eq!(names("x.rs", src), vec!["alpha", "method"]);
+        assert_eq!(
+            names("x.rs", src),
+            vec![
+                "alpha",
+                "beta",
+                "gamma",
+                "Bar::clone",
+                "Foo::method",
+                "Run::run",
+                "Run::twice",
+                "Bar::new",
+                "it_works",
+            ]
+        );
     }
 
     #[test]
-    fn rust_def_strips_qualifiers_and_rejects_non_fn() {
-        assert_eq!(rust_def("pub async fn foo() {"), Some("foo".into()));
-        assert_eq!(rust_def("    let x = 5;"), None);
-        assert_eq!(rust_def("struct S {"), None);
-    }
-
-    #[test]
-    fn ts_def_accepts_functions_skips_scalars() {
-        assert_eq!(ts_def("export function foo() {"), Some("foo".into()));
-        assert_eq!(ts_def("const bar = () => {"), Some("bar".into()));
+    fn ts_symbols_are_named_functions_and_methods() {
+        let src = "\
+export function foo() {}
+export default function () {}
+function* gen() {}
+function over(a: string): void;
+const bar = () => {};
+const Foo: React.FC<Props> = ({ x }) => <div />;
+const Memo = memo(() => <div />);
+const n = 5;
+const q = useQuery({ queryKey: ['k'] });
+const config = { retries: 3 };
+const handlers = {
+  onOpen() {},
+  onClose: () => {},
+  nested: { 'on-key'() {} },
+};
+class Client {
+  constructor() {}
+  fetch() {}
+  handle = () => {};
+  count = 0;
+}
+abstract class Base {
+  abstract run(): void;
+}
+declare class Declared {
+  over(a: string): void;
+  over(a: number): void;
+}
+interface Shape {
+  area(): number;
+}
+export default {
+  fetch(req) {},
+};
+export default makeHandler(async (event) => {});
+describe('x', () => {
+  it('y', () => {});
+});
+";
         assert_eq!(
-            ts_def("export default function baz() {"),
-            Some("baz".into())
+            names("x.tsx", src),
+            vec![
+                "foo",
+                "default",
+                "gen",
+                "over",
+                "bar",
+                "Foo",
+                "Memo",
+                "handlers.onOpen",
+                "handlers.onClose",
+                "handlers.nested.on-key",
+                "Client.constructor",
+                "Client.fetch",
+                "Client.handle",
+                "Base.run",
+                "Declared.over",
+                "Declared.over",
+                "fetch",
+                "default",
+            ]
         );
-        assert_eq!(ts_def("const n = 5"), None);
-        // A type annotation between the name and `=` must not hide a typed FC component.
-        assert_eq!(
-            ts_def("export const Foo: React.FC<Props> = ({ x }) => {"),
-            Some("Foo".into())
-        );
-        // Known over-capture: `= someCall(` is indistinguishable from a function const
-        // without type info. Locked as current behavior, not endorsed.
-        assert_eq!(ts_def("const q = useQuery("), Some("q".into()));
     }
 
     #[test]
@@ -971,7 +1130,7 @@ index 1111111..2222222 100644
     }
 
     // Same-named defs in one file (`new` in two impls) are separate symbols; each keeps its own
-    // signals instead of being summed under one name.
+    // signals instead of being summed under one name, and its owner tells them apart.
     #[test]
     fn same_name_defs_stay_separate_rows() {
         let source = "\
@@ -998,8 +1157,8 @@ impl B {
         assert_eq!(
             out,
             vec![
-                ("new".to_string(), 1, vec![]),
-                ("new".to_string(), 2, vec![])
+                ("A::new".to_string(), 1, vec![]),
+                ("B::new".to_string(), 2, vec![])
             ]
         );
     }

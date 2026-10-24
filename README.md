@@ -4,9 +4,9 @@ A small CLI that collects **facts** about the symbols a `git diff` changed, so a
 decide *where to read first*. It explains nothing and judges nothing — it points.
 
 It is **not** a static analyzer or a code-review tool: it runs no semantic analysis and
-makes no judgments. It pulls coarse, heuristic signals out of a `git diff` as raw material
-for a human. **v0.x** — detection is heuristic, not a parser; the output is meant to be
-skimmed and falsified, not trusted.
+makes no judgments. It pulls coarse signals out of a `git diff` as raw material for a
+human. **v0.x** — symbols are found with a parser (tree-sitter), but the signals attached
+to them are crude on purpose; the output is meant to be skimmed and falsified, not trusted.
 
 ```
 signals  →  prioritize  →  interrogate
@@ -32,8 +32,9 @@ signals  →  prioritize  →  interrogate
 cargo install --locked --path .    # puts `chsig` on PATH
 ```
 
-Needs a Rust toolchain. Run `chsig` from inside the repo you want to read. The
-`chsig-prioritize` stage also needs the `claude` CLI on PATH.
+Needs a Rust toolchain and a C compiler (for the tree-sitter grammars). Run `chsig` from
+inside the repo you want to read. The `chsig-prioritize` stage also needs the `claude` CLI
+on PATH.
 
 ## Stages
 
@@ -74,36 +75,43 @@ tool picks where to look, not what to conclude.
 
 ## Limitations
 
-- Heuristic symbol detection for Rust and TypeScript/JavaScript only; other files are skipped.
-- Changes outside a recognized definition are not shown. Unrecognized forms include TS class
-  methods (`foo() {`), Rust `pub(super) fn` / `extern "C" fn`, and Rust fns nested deeper than
-  `MAX_DEF_DEPTH` (e.g. `impl` inside `mod`).
+- Symbols are found for Rust and TypeScript/JavaScript only; other files are skipped.
+- A symbol is the outermost named function or method: free functions, methods of an
+  `impl`/trait/class/object literal (shown as `Foo::new`, `Client.fetch`), variables
+  bound to a function or to a call handed one (`memo(() => ...)`), and an anonymous
+  `export default` of either (shown as `default`, with `refs=?` since it has no name to
+  grep for). A named function inside another one is not a symbol of its own — a
+  component's handlers attribute to the component.
+- Changes outside every symbol are not shown: types, imports, module-level statements,
+  doc comments and attributes above a function, and code only inside anonymous callbacks
+  (most of a `describe`/`it` test file).
+- A wholly deleted symbol is not shown, and its removed lines can attribute to the next,
+  unchanged symbol.
+- When the parser hits syntax it can't read, chsig warns `parse errors in <file>; symbol
+  ranges may be off` on stderr. The TypeScript grammar does not read `import('...')` types
+  inside type arguments (e.g. `importOriginal<typeof import('x')>()`), nor call signatures
+  in an interface or type literal separated only by newlines.
 - `refs` is `git grep`-based (tracked files across the whole repo, as in the working tree),
-  not resolved references.
+  matching the bare name, not resolved references.
 - `branch` and the boundary tags (`db`/`cache`/`net`) are crude substring markers, not
   semantic analysis.
-- Nested / multi-line constructs may attribute coarsely to the parent symbol.
-- Braces are counted without skipping strings or comments. When the count doesn't return to
-  zero (or goes below it), chsig warns `unbalanced braces in <file>; symbol ranges may be off`
-  on stderr. A stray `{` and `}` that cancel out are not detected and can still shift a range.
 - No risk score and no safe-to-skip verdict — it only points at where to read.
 
-These are deliberate: making any of them precise means type resolution or a real parser,
-which would turn this into a different, heavier tool. The coarseness keeps a human in the loop.
+The signals stay crude on purpose: making them precise means type resolution, which would
+turn this into a different, heavier tool. The coarseness keeps a human in the loop.
 
 ## Tunables
 
-The one project-specific seam is the const block at the top of `src/main.rs`
-(`MAX_DEF_DEPTH`, boundary vocabulary). It encodes the stack and shape of the repo you
-point chsig at (e.g. react-query, SQL; React-style one-level hook nesting); edit it to
-retarget. Kept as consts rather than an
-external config file until a second repo needs different values — only then is the varying
-axis known well enough to design a schema. Until then the block *is* the example.
+The one project-specific seam is the const block at the top of `src/main.rs` (the boundary
+vocabulary). It encodes the stack of the repo you point chsig at (e.g. react-query, SQL);
+edit it to retarget. Kept as consts rather than an external config file until a second repo
+needs different values — only then is the varying axis known well enough to design a
+schema. Until then the block *is* the example.
 
 ## Tests
 
-`cargo test` — unit tests pin the current heuristic behavior (including known
-over-captures) as a regression anchor. I/O functions (git, disk) are left to integration.
+`cargo test` — unit tests pin the current behavior (including known defects) as a
+regression anchor. I/O functions (git, disk) are left to integration.
 
 ## License
 
