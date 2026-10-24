@@ -110,7 +110,8 @@ tool picks where to look, not what to conclude.
   matching the bare name, not resolved references.
 - `calls` names callees syntactically and resolves nothing: `tx` is just the receiver's name,
   a receiver that is itself an expression (`(a + b).abs()`, a literal) shows as `*`, and a call
-  through an expression (`fns[i]()`) is not listed.
+  through an expression (`fns[i]()`) is not listed. Nor is a TypeScript tagged template with
+  type arguments (``sql<Row>`...` ``): the grammar misreads it, often without a parse error.
 - `branch` is the net change in branch points on changed lines, read from the syntax tree:
   `if` (an `else if` counts once), a final `else`, `case` / `default` / match arms, ternaries,
   `&&` / `||` / `??`, and Rust's `let ... else`; loops are not counted. It counts syntax, not
