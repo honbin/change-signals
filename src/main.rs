@@ -10,7 +10,7 @@
 use std::io::{self, Write};
 use std::process::{Command, Stdio};
 
-use diff::{ChangedFile, ChangedLine, Side, Unreadable, parse_diff};
+use diff::{ChangedFile, ChangedLine, ParsedDiff, Side, Skipped, Unreadable, parse_diff};
 use symbols::{SymbolDef, SymbolDefs, find_symbol_defs};
 
 mod diff;
@@ -39,8 +39,8 @@ fn main() {
         return;
     }
 
-    let files = match parse_diff(&diff) {
-        Ok(files) => files,
+    let ParsedDiff { files, skipped } = match parse_diff(&diff) {
+        Ok(parsed) => parsed,
         Err(Unreadable(line)) => {
             eprintln!(
                 "chsig: can't read git's diff output at {line:?}; pass revisions and paths, \
@@ -49,6 +49,15 @@ fn main() {
             std::process::exit(1);
         }
     };
+    for skip in &skipped {
+        match skip {
+            Skipped::Quoted(path) => eprintln!("chsig: skipping quoted path {path}"),
+            Skipped::Combined(path) => eprintln!(
+                "chsig: skipping {path}: a combined diff (merge or conflict) is not read; \
+                 diff against one parent, as in `<merge>^1 <merge>` or `HEAD`"
+            ),
+        }
+    }
     // Handle write errors explicitly: BrokenPipe is expected when the reader exits early.
     let mut out = io::stdout().lock();
     for file in &files {

@@ -38,9 +38,26 @@ pub(crate) enum ChangedLine {
 #[derive(Debug)]
 pub(crate) struct Unreadable(pub(crate) String);
 
-pub(crate) fn parse_diff(diff: &str) -> Result<Vec<ChangedFile>, Unreadable> {
+/// A file the diff names but `parse_diff` doesn't read, by its header path. The caller says so,
+/// rather than the file dropping out silently.
+#[derive(Debug, PartialEq)]
+pub(crate) enum Skipped {
+    /// C-quoted (`"`, `\`, control chars survive core.quotePath=false); not unquoted here.
+    Quoted(String),
+    /// A combined diff, which git shows for a merge or a conflicted worktree file even when
+    /// asked for nothing special; its two-column lines read as no single side's.
+    Combined(String),
+}
+
+pub(crate) struct ParsedDiff {
+    pub(crate) files: Vec<ChangedFile>,
+    pub(crate) skipped: Vec<Skipped>,
+}
+
+pub(crate) fn parse_diff(diff: &str) -> Result<ParsedDiff, Unreadable> {
     let unreadable = |line: &str| Err(Unreadable(line.to_string()));
     let mut files = Vec::new();
+    let mut skipped = Vec::new();
     let mut seen_header = false;
     let mut current: Option<ChangedFile> = None;
     // Seen before the `+++` line, which completes the file header.
@@ -109,8 +126,6 @@ pub(crate) fn parse_diff(diff: &str) -> Result<Vec<ChangedFile>, Unreadable> {
             combined = false;
             continue;
         }
-        // git shows a merge, or a conflicted file in the worktree, as a combined diff even
-        // when asked for nothing special; its two-column lines read as no single side's.
         if let Some(path) = ["diff --cc ", "diff --combined "]
             .iter()
             .find_map(|p| line.strip_prefix(p))
@@ -119,10 +134,7 @@ pub(crate) fn parse_diff(diff: &str) -> Result<Vec<ChangedFile>, Unreadable> {
             if let Some(f) = current.take() {
                 files.push(f);
             }
-            eprintln!(
-                "chsig: skipping {path}: a combined diff (merge or conflict) is not read; \
-                 diff against one parent, as in `<merge>^1 <merge>` or `HEAD`"
-            );
+            skipped.push(Skipped::Combined(path.to_string()));
             combined = true;
             continue;
         }
@@ -144,10 +156,8 @@ pub(crate) fn parse_diff(diff: &str) -> Result<Vec<ChangedFile>, Unreadable> {
         // git appends a tab to a header path that contains a space.
         let header_path = |p: &str| p.strip_suffix('\t').unwrap_or(p).to_string();
         if line.starts_with("--- \"") || line.starts_with("+++ \"") {
-            // C-quoted path (`"`, `\`, control chars survive core.quotePath=false). Not
-            // unquoted here; say so rather than drop the file silently.
             if !quoted {
-                eprintln!("chsig: skipping quoted path {}", &line[4..]);
+                skipped.push(Skipped::Quoted(line[4..].to_string()));
             }
             quoted = true;
             continue;
@@ -200,7 +210,7 @@ pub(crate) fn parse_diff(diff: &str) -> Result<Vec<ChangedFile>, Unreadable> {
     if !seen_header && let Some(first) = diff.lines().find(|l| !l.trim().is_empty()) {
         return unreadable(first);
     }
-    Ok(files)
+    Ok(ParsedDiff { files, skipped })
 }
 
 struct HunkHeader {
@@ -254,7 +264,7 @@ index abc1234..def5678 100644
 +new3
  line3
 ";
-        let files = parse_diff(diff).unwrap();
+        let files = parse_diff(diff).unwrap().files;
         assert_eq!(files.len(), 1);
         let f = &files[0];
         assert_eq!(f.path(), "src/x.ts");
@@ -290,7 +300,7 @@ index 1111111..2222222 100644
 -old
 +new
 ";
-        let files = parse_diff(diff).unwrap();
+        let files = parse_diff(diff).unwrap().files;
         assert_eq!(files.len(), 2);
         assert_eq!(files[0].lines, vec![Removed(2), Added(2), Added(3),]);
         assert_eq!(files[1].path(), "y.rs");
@@ -302,7 +312,7 @@ index 1111111..2222222 100644
     #[test]
     fn parse_diff_strips_header_tab_and_counts_empty_context() {
         let diff = "diff --git a/s p.rs b/s p.rs\nindex abc1234..def5678 100644\n--- a/s p.rs\t\n+++ b/s p.rs\t\n@@ -1,2 +1,3 @@\n fn a() {\n\n+x\n";
-        let files = parse_diff(diff).unwrap();
+        let files = parse_diff(diff).unwrap().files;
         assert_eq!(files[0].path(), "s p.rs");
         assert_eq!(files[0].old.as_ref().unwrap().path, "s p.rs");
         assert_eq!(files[0].lines, vec![Added(3)]);
@@ -339,7 +349,7 @@ index 0000000..3333333
 @@ -0,0 +1 @@
 +fn b() {}
 ";
-        let files = parse_diff(diff).unwrap();
+        let files = parse_diff(diff).unwrap().files;
         let sides: Vec<_> = files
             .iter()
             .map(|f| {
@@ -403,15 +413,13 @@ index 1111111..2222222 100644
 -old
 +new
 ";
-        let files = parse_diff(diff).unwrap();
-        let paths: Vec<_> = files.iter().map(|f| f.path()).collect();
+        let parsed = parse_diff(diff).unwrap();
+        assert_eq!(parsed.skipped, vec![Skipped::Combined("a.rs".to_string())]);
+        let paths: Vec<_> = parsed.files.iter().map(|f| f.path()).collect();
         assert_eq!(paths, vec!["b.rs"]);
-        assert_eq!(files[0].lines, vec![Removed(1), Added(1)]);
-        assert!(
-            parse_diff(&diff[..diff.find("diff --git").unwrap()])
-                .unwrap()
-                .is_empty()
-        );
+        assert_eq!(parsed.files[0].lines, vec![Removed(1), Added(1)]);
+        let alone = parse_diff(&diff[..diff.find("diff --git").unwrap()]).unwrap();
+        assert!(alone.files.is_empty());
     }
 
     #[test]
