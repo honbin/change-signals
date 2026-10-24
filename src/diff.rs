@@ -55,6 +55,76 @@ pub(crate) struct ParsedDiff {
     pub(crate) skipped: Vec<Skipped>,
 }
 
+/// The hunk being read: the next line number and the lines still owed, per side.
+#[derive(Default)]
+struct HunkState<'a> {
+    old_line: usize,
+    new_line: usize,
+    old_remaining: usize,
+    new_remaining: usize,
+    /// The header, until one of the hunk's lines is added or removed: git emits no hunk
+    /// without a change, so one that ends unchanged was read wrongly.
+    unchanged_header: Option<&'a str>,
+}
+
+impl<'a> HunkState<'a> {
+    /// While lines are owed every line is content, so a body like `++x` (diff line `+++x`) is
+    /// never mistaken for a file header.
+    fn active(&self) -> bool {
+        self.old_remaining > 0 || self.new_remaining > 0
+    }
+
+    fn start(&mut self, header: &'a str, hunk: HunkHeader) {
+        self.old_line = hunk.old_start;
+        self.new_line = hunk.new_start;
+        self.old_remaining = hunk.old_count;
+        self.new_remaining = hunk.new_count;
+        self.unchanged_header = Some(header);
+    }
+
+    fn consume(
+        &mut self,
+        line: &str,
+        changed: Option<&mut Vec<ChangedLine>>,
+    ) -> Result<(), Unreadable> {
+        match line.as_bytes().first() {
+            Some(b'+') => {
+                if let Some(changed) = changed {
+                    changed.push(ChangedLine::Added(self.new_line));
+                }
+                self.new_line += 1;
+                self.new_remaining = self.new_remaining.saturating_sub(1);
+                self.unchanged_header = None;
+            }
+            Some(b'-') => {
+                if let Some(changed) = changed {
+                    changed.push(ChangedLine::Removed(self.old_line));
+                }
+                self.old_line += 1;
+                self.old_remaining = self.old_remaining.saturating_sub(1);
+                self.unchanged_header = None;
+            }
+            Some(b'\\') => {} // `\ No newline at end of file`
+            // Context; an empty line is context whose leading space was stripped
+            // (`diff.suppressBlankEmpty`).
+            None | Some(b' ') => {
+                self.old_line += 1;
+                self.new_line += 1;
+                self.old_remaining = self.old_remaining.saturating_sub(1);
+                self.new_remaining = self.new_remaining.saturating_sub(1);
+            }
+            // A diff's content lines always carry a prefix; `--word-diff` lines don't.
+            Some(_) => return Err(Unreadable(line.to_string())),
+        }
+        if !self.active()
+            && let Some(header) = self.unchanged_header
+        {
+            return Err(Unreadable(header.to_string()));
+        }
+        Ok(())
+    }
+}
+
 pub(crate) fn parse_diff(diff: &str) -> Result<ParsedDiff, Unreadable> {
     let unreadable = |line: &str| Err(Unreadable(line.to_string()));
     let mut files = Vec::new();
@@ -65,53 +135,11 @@ pub(crate) fn parse_diff(diff: &str) -> Result<ParsedDiff, Unreadable> {
     let mut blobs: (Option<String>, Option<String>) = (None, None);
     let mut old_path: Option<String> = None;
     let mut combined = false;
-    // Next line number within the current hunk, per side.
-    let (mut old_line, mut new_line) = (0usize, 0usize);
-    // Lines still owed to the current hunk per side. While either is non-zero every line is
-    // content, so a body like `++x` (diff line `+++x`) is never mistaken for a file header.
-    let (mut old_rem, mut new_rem) = (0usize, 0usize);
-    // The current hunk's header, until one of its lines is added or removed: git emits no hunk
-    // without a change, so one that ends unchanged was read wrongly.
-    let mut unchanged_hunk: Option<&str> = None;
+    let mut hunk = HunkState::default();
 
     for line in diff.lines() {
-        if old_rem > 0 || new_rem > 0 {
-            let lines = current.as_mut().map(|f| &mut f.lines);
-            match line.as_bytes().first() {
-                Some(b'+') => {
-                    if let Some(lines) = lines {
-                        lines.push(ChangedLine::Added(new_line));
-                    }
-                    new_line += 1;
-                    new_rem = new_rem.saturating_sub(1);
-                    unchanged_hunk = None;
-                }
-                Some(b'-') => {
-                    if let Some(lines) = lines {
-                        lines.push(ChangedLine::Removed(old_line));
-                    }
-                    old_line += 1;
-                    old_rem = old_rem.saturating_sub(1);
-                    unchanged_hunk = None;
-                }
-                Some(b'\\') => {} // `\ No newline at end of file`
-                // Context; an empty line is context whose leading space was stripped
-                // (`diff.suppressBlankEmpty`).
-                None | Some(b' ') => {
-                    old_line += 1;
-                    new_line += 1;
-                    old_rem = old_rem.saturating_sub(1);
-                    new_rem = new_rem.saturating_sub(1);
-                }
-                // A diff's content lines always carry a prefix; `--word-diff` lines don't.
-                Some(_) => return unreadable(line),
-            }
-            if old_rem == 0
-                && new_rem == 0
-                && let Some(header) = unchanged_hunk
-            {
-                return unreadable(header);
-            }
+        if hunk.active() {
+            hunk.consume(line, current.as_mut().map(|f| &mut f.lines))?;
             continue;
         }
 
@@ -199,11 +227,7 @@ pub(crate) fn parse_diff(diff: &str) -> Result<ParsedDiff, Unreadable> {
         }
         if let Some(rest) = line.strip_prefix("@@ ") {
             if let Some(h) = parse_hunk_header(rest) {
-                old_line = h.old_start;
-                new_line = h.new_start;
-                old_rem = h.old_count;
-                new_rem = h.new_count;
-                unchanged_hunk = Some(line);
+                hunk.start(line, h);
             }
             continue;
         }
@@ -312,6 +336,32 @@ index 1111111..2222222 100644
         assert_eq!(files[0].lines, vec![Removed(2), Added(2), Added(3),]);
         assert_eq!(files[1].path(), "y.rs");
         assert_eq!(files[1].lines.len(), 2);
+    }
+
+    #[test]
+    fn no_newline_marker_does_not_consume_a_hunk_line() {
+        let diff = "\
+diff --git a/x.rs b/x.rs
+index abc1234..def5678 100644
+--- a/x.rs
++++ b/x.rs
+@@ -1 +1 @@
+-old
+\\ No newline at end of file
++new
+diff --git a/y.rs b/y.rs
+index 1111111..2222222 100644
+--- a/y.rs
++++ b/y.rs
+@@ -1 +1 @@
+-before
++after
+";
+        let files = parse_diff(diff).unwrap().files;
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].lines, vec![Removed(1), Added(1)]);
+        assert_eq!(files[1].path(), "y.rs");
+        assert_eq!(files[1].lines, vec![Removed(1), Added(1)]);
     }
 
     // git appends a tab to `+++ b/<path>` when the path contains a space; `diff.suppressBlankEmpty`
