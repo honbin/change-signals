@@ -388,3 +388,19 @@ fn a_non_utf8_working_file_is_read() {
     assert_eq!(err, "");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// Changing only a function's attribute changes what it does (here, when it is compiled); the
+// function must show up, as it did not when attributes were outside its span.
+#[test]
+fn an_attribute_only_change_shows_its_function() {
+    let dir = temp_repo("attr");
+    std::fs::write(dir.join("a.rs"), "#[cfg(test)]\nfn alpha() {}\n").unwrap();
+    git(&dir, &["add", "a.rs"]);
+    git(&dir, &["commit", "-qm", "init"]);
+    std::fs::write(dir.join("a.rs"), "#[cfg(feature = \"x\")]\nfn alpha() {}\n").unwrap();
+    assert_eq!(
+        chsig(&dir, &[]),
+        "a.rs\n  alpha                        refs=1\n\n"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

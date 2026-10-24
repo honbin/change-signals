@@ -51,6 +51,15 @@ pub(crate) fn find_symbol_defs(path: &str, source: &str) -> SymbolDefs {
         .expect("parse without a timeout or cancellation returns a tree");
     let mut defs = Vec::new();
     collect_defs(tree.root_node(), source, lang, None, &mut defs);
+    // A def's span starts at its decorators, so a function in their arguments
+    // (`@UseInterceptors(X({ destination: () => … }))`) lands inside it; it folds into the
+    // def like any nested function.
+    let spans: Vec<(usize, usize)> = defs.iter().map(|d| (d.start, d.end)).collect();
+    defs.retain(|d| {
+        !spans
+            .iter()
+            .any(|&(s, e)| s <= d.start && d.end <= e && (s, e) != (d.start, d.end))
+    });
     defs.sort_by_key(|d| d.start);
     let mut calls = Vec::new();
     collect_calls(tree.root_node(), source, &mut calls);
@@ -158,7 +167,7 @@ fn collect_defs(node: Node, src: &str, lang: Lang, owner: Option<&str>, out: &mu
         out.push(SymbolDef {
             name: qualify(ident.as_deref().unwrap_or("default")),
             ident,
-            start: node.start_position().row + 1,
+            start: start_with_attributes(node),
             end: node.end_position().row + 1,
         });
         return;
@@ -166,10 +175,38 @@ fn collect_defs(node: Node, src: &str, lang: Lang, owner: Option<&str>, out: &mu
     // Owners nest: a method in `const api = { users: { list() {} } }` is `api.users.list`.
     let own = owner_name(node, src, lang).map(|o| qualify(&o));
     let owner = own.as_deref().or(owner);
+    // `@Dec export class B {}` hangs the decorators on the export, not the class; they are
+    // still the class's, as they are without `export`.
+    let decorated = node
+        .child_by_field_name("declaration")
+        .filter(|_| node.kind() == "export_statement")
+        .and_then(|d| owner_name(d, src, lang))
+        .map(|o| qualify(&o));
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
+        let owner = match child.kind() {
+            "decorator" => decorated.as_deref().or(owner),
+            _ => owner,
+        };
         collect_defs(child, src, lang, owner, out);
     }
+}
+
+/// The 1-based line a def's span starts on: its first attribute or decorator, since those
+/// change what it does (routing, `cfg`, `#[test]`), but not a doc comment above them, which
+/// doesn't. A comment between an attribute and the def falls inside the span regardless.
+fn start_with_attributes(def: Node) -> usize {
+    let mut start = def.start_position().row;
+    let mut sibling = def.prev_named_sibling();
+    while let Some(s) = sibling {
+        match s.kind() {
+            "attribute_item" | "decorator" => start = s.start_position().row,
+            "line_comment" | "block_comment" | "comment" => {}
+            _ => break,
+        }
+        sibling = s.prev_named_sibling();
+    }
+    start + 1
 }
 
 fn text<'a>(node: Node, src: &'a str) -> &'a str {
@@ -441,6 +478,37 @@ export function createWidget(
         }
     }
 
+    // Attributes and decorators belong to the def they precede; a doc comment above them
+    // doesn't.
+    #[test]
+    fn attributes_and_decorators_start_the_span_but_doc_comments_do_not() {
+        let rs = "\
+fn before() {}
+/// Docs.
+#[cfg(test)]
+// note
+#[inline]
+fn f() {}
+";
+        let defs = find_symbol_defs("a.rs", rs).defs;
+        assert_eq!((defs[0].start, defs[0].end), (1, 1));
+        assert_eq!((defs[1].start, defs[1].end), (3, 6));
+
+        let ts = "\
+class C {
+  /** Docs. */
+  @Get('a')
+  @Auth()
+  h() {}
+}
+";
+        let defs = find_symbol_defs("a.ts", ts).defs;
+        assert_eq!(
+            (defs[0].name.as_str(), defs[0].start, defs[0].end),
+            ("C.h", 3, 5)
+        );
+    }
+
     #[test]
     fn nested_named_functions_fold_into_the_outermost() {
         let src = "\
@@ -454,6 +522,22 @@ export const useThing = () => {
 export const makeRequest = () => new Req()
 ";
         assert_eq!(names("hook.ts", src), vec!["useThing", "makeRequest"]);
+    }
+
+    #[test]
+    fn functions_in_a_methods_decorators_fold_into_the_method() {
+        let src = "\
+@Module({ providers: [{ useFactory: () => 1 }] })
+class C {
+  @Use(Intercept({
+    destination: (r) => r,
+  }))
+  upload() {}
+}
+";
+        assert_eq!(names("a.ts", src), vec!["C.useFactory", "C.upload"]);
+        let exported = src.replacen("class C", "export class C", 1);
+        assert_eq!(names("a.ts", &exported), vec!["C.useFactory", "C.upload"]);
     }
 
     #[test]

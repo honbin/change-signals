@@ -92,8 +92,9 @@ tool picks where to look, not what to conclude.
   grep for). A named function inside another one is not a symbol of its own — a
   component's handlers attribute to the component.
 - Changes outside every symbol are not shown: types, imports, module-level statements,
-  doc comments and attributes above a function, and code only inside anonymous callbacks
-  (most of a `describe`/`it` test file).
+  doc comments above a function, decorators on a class, and code only inside anonymous
+  callbacks (most of a `describe`/`it` test file). A function's attributes and decorators
+  (`#[cfg]`, `@Get(...)`) belong to it, since they change what it does.
 - Added lines are placed on the new side's symbols and removed lines on the old side's.
   Symbols are matched across the two sides by name; one whose name exists on only one side
   is marked `new` or `deleted`, so a rename shows as one of each (no rename is inferred).
