@@ -106,7 +106,8 @@ tool picks where to look, not what to conclude.
 - Pass revisions and paths. An option that changes the diff's format (`--color`,
   `--word-diff`, `--stat`, `-R`) is refused with an error, since chsig reads the plain patch.
   A combined diff (a merge, `<merge>^!`, or a conflicted file) is skipped with a notice;
-  name one parent instead (`<merge>^1 <merge>`, or `HEAD` during a conflict).
+  name one parent instead (`<merge>^1 <merge>`, or `HEAD` during a conflict). So is a path
+  git still quotes (one with `"`, `\`, or a control character), which chsig doesn't unquote.
 - A working file is read only if it hashes (with git's filters) to the diff's new-side blob;
   otherwise it is skipped with a notice, as for a retargeted symlink. A filter that swaps the
   whole content, such as Git LFS, still passes the check while the diff describes the pointer.

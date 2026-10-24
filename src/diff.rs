@@ -42,7 +42,8 @@ pub(crate) struct Unreadable(pub(crate) String);
 /// rather than the file dropping out silently.
 #[derive(Debug, PartialEq)]
 pub(crate) enum Skipped {
-    /// C-quoted (`"`, `\`, control chars survive core.quotePath=false); not unquoted here.
+    /// C-quoted (`"`, `\`, control chars survive core.quotePath=false). Kept in its quoted form,
+    /// prefix dropped, since it is not unquoted here.
     Quoted(String),
     /// A combined diff, which git shows for a merge or a conflicted worktree file even when
     /// asked for nothing special; its two-column lines read as no single side's.
@@ -63,7 +64,6 @@ pub(crate) fn parse_diff(diff: &str) -> Result<ParsedDiff, Unreadable> {
     // Seen before the `+++` line, which completes the file header.
     let mut blobs: (Option<String>, Option<String>) = (None, None);
     let mut old_path: Option<String> = None;
-    let mut quoted = false;
     let mut combined = false;
     // Next line number within the current hunk, per side.
     let (mut old_line, mut new_line) = (0usize, 0usize);
@@ -122,7 +122,6 @@ pub(crate) fn parse_diff(diff: &str) -> Result<ParsedDiff, Unreadable> {
             }
             blobs = (None, None);
             old_path = None;
-            quoted = false;
             combined = false;
             continue;
         }
@@ -155,18 +154,18 @@ pub(crate) fn parse_diff(diff: &str) -> Result<ParsedDiff, Unreadable> {
         }
         // git appends a tab to a header path that contains a space.
         let header_path = |p: &str| p.strip_suffix('\t').unwrap_or(p).to_string();
-        if line.starts_with("--- \"") || line.starts_with("+++ \"") {
-            if !quoted {
-                skipped.push(Skipped::Quoted(line[4..].to_string()));
+        // The pinned prefixes, inside the quotes of a C-quoted path too; anything else (`-R`
+        // swaps them) would leave both sides unread.
+        let side_path = |rest: &str, prefix: &str| {
+            let (quote, unquoted) = match rest.strip_prefix('"') {
+                Some(inner) => ("\"", inner),
+                None => ("", rest),
+            };
+            match unquoted.strip_prefix(prefix) {
+                Some(path) => Ok(Some(format!("{quote}{}", header_path(path)))),
+                None if rest == "/dev/null" => Ok(None),
+                None => Err(Unreadable(line.to_string())),
             }
-            quoted = true;
-            continue;
-        }
-        // The pinned prefixes; anything else (`-R` swaps them) would leave both sides unread.
-        let side_path = |rest: &str, prefix: &str| match rest.strip_prefix(prefix) {
-            Some(path) => Ok(Some(header_path(path))),
-            None if rest == "/dev/null" => Ok(None),
-            None => Err(Unreadable(line.to_string())),
         };
         if let Some(rest) = line.strip_prefix("--- ") {
             old_path = side_path(rest, "a/")?;
@@ -174,7 +173,15 @@ pub(crate) fn parse_diff(diff: &str) -> Result<ParsedDiff, Unreadable> {
         }
         if let Some(rest) = line.strip_prefix("+++ ") {
             let new_path = side_path(rest, "b/")?;
-            if !quoted {
+            // Only a C-quoted path starts with `"`.
+            let quoted = [&old_path, &new_path]
+                .into_iter()
+                .flatten()
+                .find(|p| p.starts_with('"'));
+            if let Some(path) = quoted {
+                skipped.push(Skipped::Quoted(path.clone()));
+                old_path = None;
+            } else {
                 let (old_blob, new_blob) = std::mem::take(&mut blobs);
                 let side = |path: Option<String>, blob: Option<String>| {
                     Some(Side {
@@ -420,6 +427,29 @@ index 1111111..2222222 100644
         assert_eq!(parsed.files[0].lines, vec![Removed(1), Added(1)]);
         let alone = parse_diff(&diff[..diff.find("diff --git").unwrap()]).unwrap();
         assert!(alone.files.is_empty());
+    }
+
+    // A quoted path is skipped by its quoted form, without the prefix; a reshaped prefix
+    // inside the quotes is refused as it is outside them.
+    #[test]
+    fn quoted_paths_are_skipped_without_their_prefix() {
+        let diff = "\
+diff --git \"a/q\\\"x.rs\" \"b/q\\\"x.rs\"
+index 1111111..2222222 100644
+--- \"a/q\\\"x.rs\"
++++ \"b/q\\\"x.rs\"
+@@ -1 +1 @@
+-old
++new
+";
+        let parsed = parse_diff(diff).unwrap();
+        assert_eq!(
+            parsed.skipped,
+            vec![Skipped::Quoted("\"q\\\"x.rs\"".to_string())]
+        );
+        assert!(parsed.files.is_empty());
+        let reversed = diff.replace("--- \"a/", "--- \"b/");
+        assert!(parse_diff(&reversed).is_err());
     }
 
     #[test]

@@ -162,7 +162,7 @@ fn quoted_path_skip_is_reported() {
     let dir = repo_with_alpha_edit("quoted", "q\"x.rs");
     let (_, err) = chsig_full(&dir, &[]);
     assert!(
-        err.contains("skipping quoted path"),
+        err.contains(r#"skipping quoted path "q\"x.rs""#),
         "expected a skip notice on stderr, got:\n{err}"
     );
     let _ = std::fs::remove_dir_all(&dir);
