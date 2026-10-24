@@ -19,8 +19,9 @@ pub(crate) struct SymbolDef {
 #[derive(Default)]
 pub(crate) struct SymbolDefs {
     pub(crate) defs: Vec<SymbolDef>,
-    /// The parser recovered from syntax it could not read; spans around it may be off.
-    pub(crate) has_errors: bool,
+    /// 1-based lines, ascending, where the parser recovered from syntax it could not read; spans
+    /// around them may be off.
+    pub(crate) error_lines: Vec<usize>,
     /// (1-based line, callee) for every call in the file, placed on the line of the callee's
     /// name.
     pub(crate) calls: Vec<(usize, String)>,
@@ -67,10 +68,32 @@ pub(crate) fn find_symbol_defs(path: &str, source: &str) -> SymbolDefs {
     collect_branches(tree.root_node(), &mut branches);
     SymbolDefs {
         defs,
-        has_errors: tree.root_node().has_error(),
+        error_lines: error_lines(tree.root_node()),
         calls,
         branches,
     }
+}
+
+/// Where the parse went wrong: each ERROR node, whose contents are not descended into, and each
+/// token the parser assumed MISSING.
+fn error_lines(root: Node) -> Vec<usize> {
+    fn walk(node: Node, out: &mut Vec<usize>) {
+        if node.is_error() || node.is_missing() {
+            out.push(node.start_position().row + 1);
+            return;
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor).filter(|c| c.has_error()) {
+            walk(child, out);
+        }
+    }
+    let mut out = Vec::new();
+    if root.has_error() {
+        walk(root, &mut out);
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
 }
 
 /// Branch points: an `if` (an `else if` counts once, as its `if`), a final `else`, a `case`,
@@ -577,10 +600,10 @@ class C {
     }
 
     #[test]
-    fn syntax_errors_are_flagged() {
-        let e = |src: &str| find_symbol_defs("a.rs", src).has_errors;
-        assert!(!e("fn a() {\n    let s = \"{\";\n}\n"));
-        assert!(e("fn a( {\n}\n"));
+    fn syntax_errors_are_placed_on_their_lines() {
+        let e = |src: &str| find_symbol_defs("a.rs", src).error_lines;
+        assert!(e("fn a() {\n    let s = \"{\";\n}\n").is_empty());
+        assert_eq!(e("fn a() {}\nfn b( {\n}\nfn c() {}\n"), vec![2]);
     }
 
     // `default` is a placeholder, not a name: grepping it would count every `default` in the

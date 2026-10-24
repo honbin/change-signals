@@ -98,11 +98,11 @@ tool picks where to look, not what to conclude.
 - Added lines are placed on the new side's symbols and removed lines on the old side's.
   Symbols are matched across the two sides by name; one whose name exists on only one side
   is marked `new` or `deleted`, so a rename shows as one of each (no rename is inferred).
-- When the parser hits syntax it can't read, chsig warns `parse errors in <file>; symbol
-  ranges may be off` on stderr (`<file> (old side)` for the old side). The TypeScript
-  grammar does not read `import('...')` types inside type arguments (e.g.
-  `importOriginal<typeof import('x')>()`), nor call signatures in an interface or type
-  literal separated only by newlines.
+- When the parser hits syntax it can't read, chsig warns `parse errors in <file> at line 12;
+  symbol ranges may be off` on stderr, naming up to three lines where it went wrong
+  (`<file> (old side)` for the old side). The TypeScript grammar does not read
+  `import('...')` types inside type arguments (e.g. `importOriginal<typeof import('x')>()`),
+  nor call signatures in an interface or type literal separated only by newlines.
 - A working file is read only if it hashes (with git's filters) to the diff's new-side blob;
   otherwise it is skipped with a notice, as for a retargeted symlink. A filter that swaps the
   whole content, such as Git LFS, still passes the check while the diff describes the pointer.

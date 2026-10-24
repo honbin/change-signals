@@ -297,13 +297,22 @@ fn collect_symbols(root: &str, file: &ChangedFile, side: SourceSide) -> Vec<Symb
 
 fn parse_side(side: &Side, source: &str, label: &str) -> SymbolDefs {
     let parsed = find_symbol_defs(&side.path, source);
-    if parsed.has_errors {
+    if !parsed.error_lines.is_empty() {
         eprintln!(
-            "chsig: parse errors in {}{label}; symbol ranges may be off",
-            side.path
+            "chsig: parse errors in {}{label} at {}; symbol ranges may be off",
+            side.path,
+            render_lines(&parsed.error_lines)
         );
     }
     parsed
+}
+
+/// `line 12`, `lines 12, 40`, or the first three then `…`: where to look, not an inventory.
+fn render_lines(lines: &[usize]) -> String {
+    let shown: Vec<String> = lines.iter().take(3).map(usize::to_string).collect();
+    let more = if lines.len() > 3 { ", …" } else { "" };
+    let noun = if lines.len() == 1 { "line" } else { "lines" };
+    format!("{noun} {}{more}", shown.join(", "))
 }
 
 /// Where the new side of the diff lives, decided once from the invocation. The two are never
@@ -672,6 +681,13 @@ impl B {
         );
         assert_eq!(wrap("  calls: ", &items[..1], 24), vec!["  calls: +aaaa"]);
         assert!(wrap("  calls: ", &[], 24).is_empty());
+    }
+
+    #[test]
+    fn render_lines_names_the_first_three() {
+        assert_eq!(render_lines(&[12]), "line 12");
+        assert_eq!(render_lines(&[12, 40]), "lines 12, 40");
+        assert_eq!(render_lines(&[1, 2, 3, 4]), "lines 1, 2, 3, …");
     }
 
     #[test]

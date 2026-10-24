@@ -326,7 +326,7 @@ fn syntax_errors_warn_on_stderr_only() {
     assert!(out.starts_with("a.rs\n"), "stdout was:\n{out}");
     assert_eq!(
         err,
-        "chsig: parse errors in a.rs; symbol ranges may be off\n"
+        "chsig: parse errors in a.rs at line 8; symbol ranges may be off\n"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
