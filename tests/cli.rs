@@ -237,6 +237,25 @@ fn outside_a_repository_reports_gits_own_message() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// A textconv driver diffs converted text, so its line numbers don't match the file chsig parses,
+// while the index line still names the real blobs and the working file passes the hash check.
+#[test]
+fn a_textconv_driver_does_not_shift_lines() {
+    let dir = repo_with_alpha_edit("textconv", "a.rs");
+    std::fs::write(dir.join(".git/info/attributes"), "*.rs diff=shift\n").unwrap();
+    git(
+        &dir,
+        &[
+            "config",
+            "diff.shift.textconv",
+            "sh -c 'printf \"x\\ny\\n\"; cat \"$0\"'",
+        ],
+    );
+    let out = chsig(&dir, &[]);
+    assert!(out.contains("alpha"), "stdout was:\n{out}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // --exit-code makes git diff exit 1 on a non-empty diff with nothing on stderr; chsig must
 // not fail silently.
 #[test]

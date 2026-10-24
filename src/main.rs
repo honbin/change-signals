@@ -119,14 +119,15 @@ fn git_root() -> String {
 
 fn git_diff(args: &[String]) -> String {
     // Pin the output shape parse_diff relies on against user config (color, mnemonic or no
-    // prefix, external diff, relative paths, quoted non-ASCII paths). User args come after,
-    // so an explicit flag still wins.
+    // prefix, external diff, textconv, relative paths, quoted non-ASCII paths). User args come
+    // after, so an explicit flag still wins.
     git_stdout_or_exit(
         Command::new("git")
             .args(["-c", "core.quotePath=false", "diff"])
             .args([
                 "--no-color",
                 "--no-ext-diff",
+                "--no-textconv",
                 "--no-relative",
                 "--src-prefix=a/",
                 "--dst-prefix=b/",
