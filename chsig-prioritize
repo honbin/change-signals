@@ -37,6 +37,13 @@ Signal meanings (all facts, deliberately crude):
              references — strings/comments count, and short/common names (index, query, e)
              inflate. A high number alone is weak evidence.
 - branch±N : net change in branch tokens (if/else/match/&&/||/?.) within the diff.
+- calls: ... : names called on the changed lines, as written (receiver.method, or the root of a
+             call chain; `*` is a receiver with no name to show, as in `(a + b).abs()` or
+             a literal). +name only on added lines, -name only on removed lines, bare name
+             on both.
+             No meaning is attached: judge from the names yourself which calls cross a
+             boundary such as persistence, network, filesystem or process, and which are
+             plain in-memory work.
 - new|deleted : the symbol name is defined only after / only before the change. Matched
                 by name, so a rename appears as one deleted and one new symbol.
 

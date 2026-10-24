@@ -16,10 +16,14 @@ pub(crate) struct SymbolDef {
     pub(crate) end: usize,   // 1-based line where the body closes (== start for a one-liner)
 }
 
+#[derive(Default)]
 pub(crate) struct SymbolDefs {
     pub(crate) defs: Vec<SymbolDef>,
     /// The parser recovered from syntax it could not read; spans around it may be off.
     pub(crate) has_errors: bool,
+    /// (1-based line, callee) for every call in the file, placed on the line of the callee's
+    /// name.
+    pub(crate) calls: Vec<(usize, String)>,
 }
 
 /// Named functions and methods with their spans, ascending by start, for the file's language.
@@ -34,10 +38,7 @@ pub(crate) struct SymbolDefs {
 /// can't locate; the cost is that a component's handlers no longer show separately.
 pub(crate) fn find_symbol_defs(path: &str, source: &str) -> SymbolDefs {
     let Some((language, lang)) = grammar_for(path) else {
-        return SymbolDefs {
-            defs: Vec::new(),
-            has_errors: false,
-        };
+        return SymbolDefs::default();
     };
     let mut parser = Parser::new();
     parser
@@ -49,9 +50,12 @@ pub(crate) fn find_symbol_defs(path: &str, source: &str) -> SymbolDefs {
     let mut defs = Vec::new();
     collect_defs(tree.root_node(), source, lang, None, &mut defs);
     defs.sort_by_key(|d| d.start);
+    let mut calls = Vec::new();
+    collect_calls(tree.root_node(), source, &mut calls);
     SymbolDefs {
         defs,
         has_errors: tree.root_node().has_error(),
+        calls,
     }
 }
 
@@ -168,6 +172,127 @@ fn def_name(node: Node, src: &str, lang: Lang) -> Option<DefName> {
         _ => None,
     }?;
     (!ident.is_empty()).then(|| DefName::Ident(ident.to_string()))
+}
+
+/// Every call's callee, named as written at the call: `recv.method`, a bare `name`,
+/// `Path::name`, `new Name`, or `name!` for a Rust macro. No vocabulary on purpose: which calls
+/// cross a boundary (a database, the network) depends on the libraries a repo uses, and is the
+/// reader's judgment, not a fact chsig can state.
+fn collect_calls(node: Node, src: &str, out: &mut Vec<(usize, String)>) {
+    if let Some((name, at)) = callee(node, src) {
+        out.push((at.start_position().row + 1, name));
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_calls(child, src, out);
+    }
+}
+
+fn callee<'t>(node: Node<'t>, src: &str) -> Option<(String, Node<'t>)> {
+    match node.kind() {
+        "call_expression" => call_target(node.child_by_field_name("function")?, src),
+        "new_expression" => {
+            let (name, at) = call_target(node.child_by_field_name("constructor")?, src)?;
+            Some((format!("new {name}"), at))
+        }
+        "macro_invocation" => {
+            let (name, at) = call_target(node.child_by_field_name("macro")?, src)?;
+            Some((format!("{name}!"), at))
+        }
+        _ => None,
+    }
+}
+
+/// The name a call goes to, and the node holding it (where the call is placed). A call whose
+/// target is itself an expression (`fns[i]()`, `(a || b)()`) has no name and is skipped.
+fn call_target<'t>(f: Node<'t>, src: &str) -> Option<(String, Node<'t>)> {
+    match f.kind() {
+        "identifier" => Some((text(f, src).to_string(), f)),
+        "generic_function" => call_target(f.child_by_field_name("function")?, src),
+        "scoped_identifier" => {
+            let name = f.child_by_field_name("name")?;
+            let full = match f.child_by_field_name("path") {
+                Some(path) => format!("{}::{}", last_segment(path, src), text(name, src)),
+                None => text(name, src).to_string(),
+            };
+            Some((full, name))
+        }
+        "member_expression" | "field_expression" => {
+            let (object, property) = member_parts(f)?;
+            let recv = receiver_name(object, src).unwrap_or("*");
+            Some((format!("{recv}.{}", text(property, src)), property))
+        }
+        _ => None,
+    }
+}
+
+/// (object, property) of `a.b` in either grammar.
+fn member_parts(n: Node) -> Option<(Node, Node)> {
+    let (object, property) = match n.kind() {
+        "member_expression" => ("object", "property"),
+        "field_expression" => ("value", "field"),
+        _ => return None,
+    };
+    Some((
+        n.child_by_field_name(object)?,
+        n.child_by_field_name(property)?,
+    ))
+}
+
+/// The receiver's own name (`tx`, `this`, `SETTINGS` in `env.SETTINGS`), or, when the receiver
+/// is a call (`db.select().from`), the name its call chain starts from.
+fn receiver_name<'s>(n: Node, src: &'s str) -> Option<&'s str> {
+    match n.kind() {
+        "member_expression" | "field_expression" => Some(text(member_parts(n)?.1, src)),
+        "call_expression" => chain_root(n.child_by_field_name("function")?, src),
+        "scoped_identifier" => Some(last_segment(n, src)),
+        k if is_name(k) => Some(text(n, src)),
+        _ => receiver_name(wrapped(n)?, src),
+    }
+}
+
+fn chain_root<'s>(n: Node, src: &'s str) -> Option<&'s str> {
+    match n.kind() {
+        "member_expression" | "field_expression" => chain_root(member_parts(n)?.0, src),
+        "call_expression" | "generic_function" => {
+            chain_root(n.child_by_field_name("function")?, src)
+        }
+        "scoped_identifier" => Some(last_segment(n, src)),
+        k if is_name(k) => Some(text(n, src)),
+        _ => chain_root(wrapped(n)?, src),
+    }
+}
+
+/// The value a node only wraps (`(x)`, `await x`, `x!`, `x?`, `x as T`, `&x`, `*x`), so a
+/// receiver is named through it. Any other expression (`a + b`, `c ? d : e`, `!x`) yields a
+/// different value and has no name of its own.
+fn wrapped(n: Node) -> Option<Node> {
+    match n.kind() {
+        "parenthesized_expression"
+        | "await_expression"
+        | "non_null_expression"
+        | "as_expression"
+        | "satisfies_expression"
+        | "try_expression" => n.named_child(0),
+        "type_cast_expression" | "reference_expression" => n.child_by_field_name("value"),
+        "unary_expression" if n.child(0).is_some_and(|op| op.kind() == "*") => n.named_child(0),
+        _ => None,
+    }
+}
+
+fn is_name(kind: &str) -> bool {
+    matches!(kind, "identifier" | "this" | "self" | "type_identifier")
+}
+
+/// `b` of `a::b`, or the node's text when it isn't a path.
+fn last_segment<'s>(n: Node, src: &'s str) -> &'s str {
+    match n
+        .child_by_field_name("name")
+        .filter(|_| n.kind() == "scoped_identifier")
+    {
+        Some(name) => text(name, src),
+        None => text(n, src),
+    }
 }
 
 /// Whether a binding's value is a function, or a call handed a function (`memo(() => ...)`,
@@ -298,6 +423,100 @@ export const makeRequest = () => new Req()
             .map(|d| (d.name.as_str(), d.ident.as_deref()))
             .collect();
         assert_eq!(got, vec![("default", None), ("f", Some("f"))]);
+    }
+
+    fn calls(path: &str, src: &str) -> Vec<String> {
+        find_symbol_defs(path, src)
+            .calls
+            .into_iter()
+            .map(|(_, c)| c)
+            .collect()
+    }
+
+    // Receivers are named as written, a call chain by the name it starts from, and nothing
+    // is resolved: `tx` is just a name here.
+    #[test]
+    fn ts_calls_are_named_as_written() {
+        let src = "\
+foo();
+tx.update(t).set(v);
+db.select().from(t).where(c);
+env.SETTINGS.get(k);
+this.client.request(p);
+(await load()).parse();
+(a || b).trim();
+(c ? d : e).run();
+sql`SELECT 1`;
+new Date();
+fns[0]();
+";
+        assert_eq!(
+            calls("a.ts", src),
+            vec![
+                "foo",
+                "tx.set",
+                "tx.update",
+                "db.where",
+                "db.from",
+                "db.select",
+                "SETTINGS.get",
+                "client.request",
+                "load.parse",
+                "load",
+                "*.trim",
+                "*.run",
+                "sql",
+                "new Date",
+            ]
+        );
+    }
+
+    #[test]
+    fn rust_calls_are_named_as_written() {
+        let src = "\
+fn f() {
+    fs::write(p, b);
+    conn.execute(q).await?.rows();
+    self.client.get(u);
+    Foo::new();
+    sqlx::query!(\"SELECT 1\");
+    (x as u64).pow(2);
+    (&mut buf).clear();
+    (a + b).abs();
+    (!s.is_empty()).then(f);
+    n.parse::<u64>().ok();
+}
+";
+        assert_eq!(
+            calls("a.rs", src),
+            vec![
+                "fs::write",
+                "conn.rows",
+                "conn.execute",
+                "client.get",
+                "Foo::new",
+                "sqlx::query!",
+                "x.pow",
+                "buf.clear",
+                "*.abs",
+                "*.then",
+                "s.is_empty",
+                "n.ok",
+                "n.parse",
+            ]
+        );
+    }
+
+    // Each call is placed on the line holding its name, so in a chain split across lines
+    // every link lands on its own line.
+    #[test]
+    fn a_call_is_placed_on_the_line_of_its_name() {
+        let src = "db\n  .select()\n  .from(t);\n";
+        let placed = find_symbol_defs("a.ts", src).calls;
+        assert_eq!(
+            placed,
+            vec![(3, "db.from".to_string()), (2, "db.select".to_string())]
+        );
     }
 
     #[test]

@@ -350,3 +350,19 @@ fn a_deleted_file_shows_its_symbols_deleted() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// Callees on changed lines follow the symbol's row, marked with the side they changed on.
+#[test]
+fn changed_calls_follow_the_symbol_row() {
+    let dir = temp_repo("calls");
+    std::fs::write(dir.join("a.rs"), "fn alpha() {\n    db.query(q);\n}\n").unwrap();
+    git(&dir, &["add", "a.rs"]);
+    git(&dir, &["commit", "-qm", "init"]);
+    std::fs::write(dir.join("a.rs"), "fn alpha() {\n    tx.update(q);\n}\n").unwrap();
+    let out = chsig(&dir, &[]);
+    assert_eq!(
+        out,
+        "a.rs\n  alpha                        refs=1\n      calls: -db.query, +tx.update\n\n"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

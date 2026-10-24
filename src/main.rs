@@ -11,7 +11,7 @@ use std::io::{self, Write};
 use std::process::Command;
 
 use diff::{ChangedFile, ChangedLine, Side, parse_diff};
-use symbols::{SymbolDef, find_symbol_defs};
+use symbols::{SymbolDef, SymbolDefs, find_symbol_defs};
 
 mod diff;
 mod symbols;
@@ -64,8 +64,39 @@ fn write_file_signals(
     writeln!(out, "{}", file.path())?;
     for sym in symbols {
         writeln!(out, "  {:<28} {}", sym.name, sym.signals.render())?;
+        for line in wrap("      calls: ", &sym.signals.render_calls(), 100) {
+            writeln!(out, "{line}")?;
+        }
     }
     writeln!(out)
+}
+
+/// Lay `items` out after `prefix`, comma-separated, continuing on lines indented to the
+/// prefix's width once a line would pass `width`. Nothing is dropped: the longest lists belong
+/// to wholly new or rewritten functions, the ones whose calls matter most.
+fn wrap(prefix: &str, items: &[String], width: usize) -> Vec<String> {
+    let mut bodies: Vec<String> = Vec::new();
+    let mut body = String::new();
+    for (i, item) in items.iter().enumerate() {
+        let sep = if i + 1 < items.len() { "," } else { "" };
+        let piece = format!("{item}{sep}");
+        if !body.is_empty() && prefix.len() + body.len() + 1 + piece.len() > width {
+            bodies.push(std::mem::take(&mut body));
+        }
+        if !body.is_empty() {
+            body.push(' ');
+        }
+        body.push_str(&piece);
+    }
+    if !body.is_empty() {
+        bodies.push(body);
+    }
+    let indent = " ".repeat(prefix.len());
+    bodies
+        .into_iter()
+        .enumerate()
+        .map(|(i, b)| format!("{}{b}", if i == 0 { prefix } else { &indent }))
+        .collect()
 }
 
 /// BrokenPipe means the reader went away (`chsig | head`) — exit quietly. Any other write error
@@ -174,6 +205,14 @@ struct Signals {
     refs: Option<usize>,
     branch_delta: i32,
     status: Option<Status>,
+    /// Callees on the changed lines, in first-seen order.
+    calls: Vec<Call>,
+}
+
+struct Call {
+    name: String,
+    on_added: bool,
+    on_removed: bool,
 }
 
 /// The symbol's name is defined on only one side of the diff. Matched by name only, so a
@@ -201,6 +240,18 @@ impl Signals {
         }
         parts.join(", ")
     }
+
+    /// `+name` called only on added lines, `-name` only on removed ones, `name` on both.
+    fn render_calls(&self) -> Vec<String> {
+        self.calls
+            .iter()
+            .map(|c| match (c.on_added, c.on_removed) {
+                (true, false) => format!("+{}", c.name),
+                (false, true) => format!("-{}", c.name),
+                _ => c.name.clone(),
+            })
+            .collect()
+    }
 }
 
 /// Read both sides of the file and attribute its changed lines to the symbols enclosing them,
@@ -214,33 +265,33 @@ fn collect_symbols(root: &str, file: &ChangedFile, side: SourceSide) -> Vec<Symb
     if !sides.clone().any(|s| symbols::is_supported(&s.path)) {
         return Vec::new(); // don't read sources that would be discarded
     }
-    let old_defs = match &file.old {
-        None => Vec::new(),
+    let old = match &file.old {
+        None => SymbolDefs::default(),
         Some(old) => {
             let Some(source) = read_blob(old, "old") else {
                 return Vec::new();
             };
-            side_defs(old, &source, " (old side)")
+            parse_side(old, &source, " (old side)")
         }
     };
-    let new_defs = match &file.new {
-        None => Vec::new(),
+    let new = match &file.new {
+        None => SymbolDefs::default(),
         Some(new) => {
             // deleted in the worktree, binary, or unreadable
             let Some(source) = read_new_side(root, new, side) else {
                 return Vec::new();
             };
-            side_defs(new, &source, "")
+            parse_side(new, &source, "")
         }
     };
-    let mut symbols = attribute_signals(&old_defs, &new_defs, &file.lines);
+    let mut symbols = attribute_signals(&old, &new, &file.lines);
     for sym in &mut symbols {
         sym.signals.refs = sym.ident.as_deref().and_then(|i| ref_line_count(root, i));
     }
     symbols
 }
 
-fn side_defs(side: &Side, source: &str, label: &str) -> Vec<SymbolDef> {
+fn parse_side(side: &Side, source: &str, label: &str) -> SymbolDefs {
     let parsed = find_symbol_defs(&side.path, source);
     if parsed.has_errors {
         eprintln!(
@@ -248,7 +299,7 @@ fn side_defs(side: &Side, source: &str, label: &str) -> Vec<SymbolDef> {
             side.path
         );
     }
-    parsed.defs
+    parsed
 }
 
 /// Where the new side of the diff lives, decided once from the invocation. The two are never
@@ -327,10 +378,11 @@ fn read_blob(side: &Side, label: &str) -> Option<String> {
 /// to measure.
 ///
 /// Signals aggregate per shown name across both sides: an edited function is one row however
-/// its lines moved, and so are overloads, which repeat one name.
+/// its lines moved, and so are overloads, which repeat one name. A call is recorded when the
+/// line holding its name changed, so an untouched call inside a changed block isn't listed.
 fn attribute_signals(
-    old_defs: &[SymbolDef],
-    new_defs: &[SymbolDef],
+    old: &SymbolDefs,
+    new: &SymbolDefs,
     lines: &[ChangedLine],
 ) -> Vec<SymbolSignals> {
     fn enclosing(defs: &[SymbolDef], line: usize) -> Option<&SymbolDef> {
@@ -338,15 +390,15 @@ fn attribute_signals(
             .filter(|d| d.start <= line && line <= d.end)
             .max_by_key(|d| d.start)
     }
-    let defined = |defs: &[SymbolDef], name: &str| defs.iter().any(|d| d.name == name);
+    let defined = |side: &SymbolDefs, name: &str| side.defs.iter().any(|d| d.name == name);
 
     let mut touched: Vec<SymbolSignals> = Vec::new();
     for changed in lines {
-        let (def, sign, body) = match changed {
-            ChangedLine::Added { line, body } => (enclosing(new_defs, *line), 1, body),
-            ChangedLine::Removed { line, body } => (enclosing(old_defs, *line), -1, body),
+        let (side, line, body, added) = match changed {
+            ChangedLine::Added { line, body } => (new, *line, body, true),
+            ChangedLine::Removed { line, body } => (old, *line, body, false),
         };
-        let Some(def) = def else {
+        let Some(def) = enclosing(&side.defs, line) else {
             continue;
         };
         let i = match touched.iter().position(|s| s.name == def.name) {
@@ -356,7 +408,7 @@ fn attribute_signals(
                     name: def.name.clone(),
                     ident: def.ident.clone(),
                     signals: Signals {
-                        status: match (defined(old_defs, &def.name), defined(new_defs, &def.name)) {
+                        status: match (defined(old, &def.name), defined(new, &def.name)) {
                             (true, false) => Some(Status::Deleted),
                             (false, true) => Some(Status::New),
                             _ => None,
@@ -367,7 +419,27 @@ fn attribute_signals(
                 touched.len() - 1
             }
         };
-        touched[i].signals.branch_delta += sign * branch_tokens(body);
+        let signals = &mut touched[i].signals;
+        let sign = if added { 1 } else { -1 };
+        signals.branch_delta += sign * branch_tokens(body);
+        for (_, name) in side.calls.iter().filter(|(l, _)| *l == line) {
+            let call = match signals.calls.iter().position(|c| c.name == *name) {
+                Some(j) => &mut signals.calls[j],
+                None => {
+                    signals.calls.push(Call {
+                        name: name.clone(),
+                        on_added: false,
+                        on_removed: false,
+                    });
+                    signals.calls.last_mut().expect("just pushed")
+                }
+            };
+            if added {
+                call.on_added = true;
+            } else {
+                call.on_removed = true;
+            }
+        }
     }
     touched
 }
@@ -431,8 +503,8 @@ mod tests {
         new: &str,
         lines: &[ChangedLine],
     ) -> Vec<(String, i32, Option<Status>)> {
-        let defs = |src: &str| find_symbol_defs(path, src).defs;
-        attribute_signals(&defs(old), &defs(new), lines)
+        let parse = |src: &str| find_symbol_defs(path, src);
+        attribute_signals(&parse(old), &parse(new), lines)
             .into_iter()
             .map(|s| (s.name, s.signals.branch_delta, s.signals.status))
             .collect()
@@ -563,6 +635,39 @@ impl B {
         );
     }
 
+    // A call kept across an edit is bare; one only added or only removed carries its side.
+    #[test]
+    fn calls_carry_the_side_they_were_changed_on() {
+        let old = "fn save() {\n    db.query(q);\n    log(a);\n}\n";
+        let new = "fn save() {\n    tx.update(q);\n    log(b);\n}\n";
+        let lines = [
+            removed(2, "    db.query(q);"),
+            removed(3, "    log(a);"),
+            added(2, "    tx.update(q);"),
+            added(3, "    log(b);"),
+        ];
+        let parse = |src: &str| find_symbol_defs("s.rs", src);
+        let out = attribute_signals(&parse(old), &parse(new), &lines);
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            out[0].signals.render_calls(),
+            vec!["-db.query", "log", "+tx.update"]
+        );
+    }
+
+    #[test]
+    fn wrap_continues_under_the_prefix_and_drops_nothing() {
+        let items: Vec<String> = ["+aaaa", "+bbbb", "+cccc", "-dddd"]
+            .map(String::from)
+            .into();
+        assert_eq!(
+            wrap("  calls: ", &items, 24),
+            vec!["  calls: +aaaa, +bbbb,", "         +cccc, -dddd"]
+        );
+        assert_eq!(wrap("  calls: ", &items[..1], 24), vec!["  calls: +aaaa"]);
+        assert!(wrap("  calls: ", &[], 24).is_empty());
+    }
+
     #[test]
     fn branch_tokens_are_substring_facts() {
         assert_eq!(branch_tokens("if (a && b) {"), 2);
@@ -586,6 +691,7 @@ impl B {
             refs: Some(1),
             branch_delta: -1,
             status: Some(Status::Deleted),
+            ..Signals::default()
         };
         assert_eq!(neg.render(), "refs=1, branch-1, deleted");
         let unmeasured = Signals {

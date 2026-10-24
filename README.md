@@ -48,12 +48,20 @@ chsig                # no args = working diff
 ```
 src/cache/store.ts
   getOrFetch                   refs=14, branch+5
+      calls: cache.get, +client.fetch, -fetchRecord, +cache.set
   evictExpired                 refs=6, branch+1
   pruneStale                   refs=0, branch-2, deleted
+      calls: -cache.keys, -cache.delete
 
 src/db/records.ts
   loadRecord                   refs=12
+      calls: -db.query, +tx.select, +tx.where
 ```
+
+`calls` lists the callees on a symbol's changed lines as written (`receiver.method`, or the
+name a call chain starts from): `+` only on added lines, `-` only on removed ones, bare on
+both. chsig attaches no meaning to them; whether `tx.select` is a database read is for the
+reader to judge.
 
 ### 2. prioritize — `chsig-prioritize`
 
@@ -96,6 +104,9 @@ tool picks where to look, not what to conclude.
   literal separated only by newlines.
 - `refs` is `git grep`-based (tracked files across the whole repo, as in the working tree),
   matching the bare name, not resolved references.
+- `calls` names callees syntactically and resolves nothing: `tx` is just the receiver's name,
+  a receiver that is itself an expression (`(a + b).abs()`, a literal) shows as `*`, and a call
+  through an expression (`fns[i]()`) is not listed.
 - `branch` is a crude substring count of branch tokens (`if`, `&&`, `?.`, ...) on changed
   lines, strings and comments included.
 - No risk score and no safe-to-skip verdict — it only points at where to read.
