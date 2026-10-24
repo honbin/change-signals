@@ -37,6 +37,8 @@ Signal meanings (all facts, deliberately crude):
              references — strings/comments count, and short/common names (index, query, e)
              inflate. A high number alone is weak evidence.
 - branch±N : net change in branch tokens (if/else/match/&&/||/?.) within the diff.
+- new|deleted : the symbol name is defined only after / only before the change. Matched
+                by name, so a rename appears as one deleted and one new symbol.
 
 Task: choose the 3-5 symbols that appear most useful to READ FIRST when investigating
 this change.

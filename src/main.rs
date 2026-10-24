@@ -10,7 +10,7 @@
 use std::io::{self, Write};
 use std::process::Command;
 
-use diff::{ChangedFile, parse_diff};
+use diff::{ChangedFile, ChangedLine, Side, parse_diff};
 use symbols::{SymbolDef, find_symbol_defs};
 
 mod diff;
@@ -61,7 +61,7 @@ fn write_file_signals(
     file: &ChangedFile,
     symbols: &[SymbolSignals],
 ) -> io::Result<()> {
-    writeln!(out, "{}", file.path)?;
+    writeln!(out, "{}", file.path())?;
     for sym in symbols {
         writeln!(out, "  {:<28} {}", sym.name, sym.signals.render())?;
     }
@@ -173,41 +173,82 @@ struct Signals {
     /// `export default`); shown as `refs=?`, distinct from `Some(0)`.
     refs: Option<usize>,
     branch_delta: i32,
+    status: Option<Status>,
+}
+
+/// The symbol's name is defined on only one side of the diff. Matched by name only, so a
+/// rename shows as one deleted and one new symbol.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Status {
+    New,
+    Deleted,
 }
 
 impl Signals {
     fn render(&self) -> String {
-        let refs = match self.refs {
+        let mut parts = vec![match self.refs {
             Some(n) => format!("refs={n}"),
             None => "refs=?".to_string(),
-        };
-        if self.branch_delta == 0 {
-            return refs;
+        }];
+        if self.branch_delta != 0 {
+            let sign = if self.branch_delta > 0 { "+" } else { "" };
+            parts.push(format!("branch{sign}{}", self.branch_delta));
         }
-        let sign = if self.branch_delta > 0 { "+" } else { "" };
-        format!("{refs}, branch{sign}{}", self.branch_delta)
+        match self.status {
+            Some(Status::New) => parts.push("new".to_string()),
+            Some(Status::Deleted) => parts.push("deleted".to_string()),
+            None => {}
+        }
+        parts.join(", ")
     }
 }
 
-/// Read the new-side source and attribute its changed lines to the enclosing symbols, then
-/// attach `refs`. The attribution itself is pure (`attribute_signals`); only the source read
-/// and the git-backed `refs` live here.
+/// Read both sides of the file and attribute its changed lines to the symbols enclosing them,
+/// then attach `refs`. The attribution itself is pure (`attribute_signals`); only the source
+/// reads and the git-backed `refs` live here.
+///
+/// If a side the diff names can't be read, the file is skipped: with one side missing, every
+/// symbol of the other would look new or deleted.
 fn collect_symbols(root: &str, file: &ChangedFile, side: SourceSide) -> Vec<SymbolSignals> {
-    let Some(source) = read_new_side(root, file, side) else {
-        return Vec::new(); // deleted, binary, unreadable, or new side absent in the chosen source
-    };
-    let parsed = find_symbol_defs(&file.path, &source);
-    if parsed.has_errors {
-        eprintln!(
-            "chsig: parse errors in {}; symbol ranges may be off",
-            file.path
-        );
+    let sides = file.old.iter().chain(&file.new);
+    if !sides.clone().any(|s| symbols::is_supported(&s.path)) {
+        return Vec::new(); // don't read sources that would be discarded
     }
-    let mut symbols = attribute_signals(&parsed.defs, file);
+    let old_defs = match &file.old {
+        None => Vec::new(),
+        Some(old) => {
+            let Some(source) = read_blob(old, "old") else {
+                return Vec::new();
+            };
+            side_defs(old, &source, " (old side)")
+        }
+    };
+    let new_defs = match &file.new {
+        None => Vec::new(),
+        Some(new) => {
+            // deleted in the worktree, binary, or unreadable
+            let Some(source) = read_new_side(root, new, side) else {
+                return Vec::new();
+            };
+            side_defs(new, &source, "")
+        }
+    };
+    let mut symbols = attribute_signals(&old_defs, &new_defs, &file.lines);
     for sym in &mut symbols {
         sym.signals.refs = sym.ident.as_deref().and_then(|i| ref_line_count(root, i));
     }
     symbols
+}
+
+fn side_defs(side: &Side, source: &str, label: &str) -> Vec<SymbolDef> {
+    let parsed = find_symbol_defs(&side.path, source);
+    if parsed.has_errors {
+        eprintln!(
+            "chsig: parse errors in {}{label}; symbol ranges may be off",
+            side.path
+        );
+    }
+    parsed.defs
 }
 
 /// Where the new side of the diff lives, decided once from the invocation. The two are never
@@ -253,71 +294,82 @@ fn source_side(args: &[String]) -> SourceSide {
 
 /// Read the new side from the chosen source — no fallback between them. On failure the file
 /// is skipped: a missing fact beats a plausible one read from the wrong source.
-fn read_new_side(root: &str, file: &ChangedFile, side: SourceSide) -> Option<String> {
+fn read_new_side(root: &str, new: &Side, side: SourceSide) -> Option<String> {
     match side {
-        SourceSide::Worktree => std::fs::read_to_string(format!("{root}/{}", file.path)).ok(),
-        SourceSide::Blob => {
-            let blob = file.new_blob.as_ref()?; // no new side (e.g. deletion): expected skip
-            let read = Command::new("git")
-                .args(["cat-file", "-p", blob])
-                .output()
-                .ok()
-                .filter(|out| out.status.success())
-                .map(|out| String::from_utf8_lossy(&out.stdout).into_owned());
-            if read.is_none() {
-                // Reading the blob failed though one was named — surface the skip, don't hide it.
-                eprintln!(
-                    "chsig: could not read new-side blob {blob} for {}; skipping",
-                    file.path
-                );
-            }
-            read
-        }
+        SourceSide::Worktree => std::fs::read_to_string(format!("{root}/{}", new.path)).ok(),
+        SourceSide::Blob => read_blob(new, "new"),
     }
 }
 
-/// Attribute changed lines to enclosing symbols, in first-seen order. Pure (no git, no disk)
-/// so the attribution — the part that just got the target wrong — is directly testable.
-///
-/// A changed line goes to the def whose `[start, end]` span contains it. Spans don't nest
-/// (`find_symbol_defs` keeps only outermost defs) but can share a line (`fn a() {} fn b() {}`),
-/// where the later def wins. refs is left `None` for the caller to measure.
-///
-/// Signals aggregate per def, not per name: two `fn new` in different impls of one file stay
-/// two rows rather than summing into one.
-fn attribute_signals(defs: &[SymbolDef], file: &ChangedFile) -> Vec<SymbolSignals> {
-    let enclosing = |line: usize| -> Option<usize> {
-        defs.iter()
-            .enumerate()
-            .filter(|(_, d)| d.start <= line && line <= d.end)
-            .max_by_key(|(_, d)| d.start)
-            .map(|(i, _)| i)
-    };
+fn read_blob(side: &Side, label: &str) -> Option<String> {
+    let read = Command::new("git")
+        .args(["cat-file", "-p", &side.blob])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| String::from_utf8_lossy(&out.stdout).into_owned());
+    if read.is_none() {
+        // A blob the diff named couldn't be read — surface the skip, don't hide it.
+        eprintln!(
+            "chsig: could not read {label}-side blob {} for {}; skipping",
+            side.blob, side.path
+        );
+    }
+    read
+}
 
-    let mut touched: Vec<(usize, Signals)> = Vec::new();
-    for (line, sign, body) in &file.changed_bodies {
-        let Some(def) = enclosing(*line) else {
+/// Attribute changed lines to enclosing symbols, in first-seen order. Pure (no git, no disk)
+/// so the attribution is directly testable.
+///
+/// An added line goes to the new-side def containing it, a removed line to the old-side one.
+/// Spans on one side don't nest (`find_symbol_defs` keeps only outermost defs) but can share a
+/// line (`fn a() {} fn b() {}`), where the later def wins. refs is left `None` for the caller
+/// to measure.
+///
+/// Signals aggregate per shown name across both sides: an edited function is one row however
+/// its lines moved, and so are overloads, which repeat one name.
+fn attribute_signals(
+    old_defs: &[SymbolDef],
+    new_defs: &[SymbolDef],
+    lines: &[ChangedLine],
+) -> Vec<SymbolSignals> {
+    fn enclosing(defs: &[SymbolDef], line: usize) -> Option<&SymbolDef> {
+        defs.iter()
+            .filter(|d| d.start <= line && line <= d.end)
+            .max_by_key(|d| d.start)
+    }
+    let defined = |defs: &[SymbolDef], name: &str| defs.iter().any(|d| d.name == name);
+
+    let mut touched: Vec<SymbolSignals> = Vec::new();
+    for changed in lines {
+        let (def, sign, body) = match changed {
+            ChangedLine::Added { line, body } => (enclosing(new_defs, *line), 1, body),
+            ChangedLine::Removed { line, body } => (enclosing(old_defs, *line), -1, body),
+        };
+        let Some(def) = def else {
             continue;
         };
-        let i = match touched.iter().position(|(d, _)| *d == def) {
+        let i = match touched.iter().position(|s| s.name == def.name) {
             Some(i) => i,
             None => {
-                touched.push((def, Signals::default()));
+                touched.push(SymbolSignals {
+                    name: def.name.clone(),
+                    ident: def.ident.clone(),
+                    signals: Signals {
+                        status: match (defined(old_defs, &def.name), defined(new_defs, &def.name)) {
+                            (true, false) => Some(Status::Deleted),
+                            (false, true) => Some(Status::New),
+                            _ => None,
+                        },
+                        ..Signals::default()
+                    },
+                });
                 touched.len() - 1
             }
         };
-        let signals = &mut touched[i].1;
-        signals.branch_delta += sign * branch_tokens(body);
+        touched[i].signals.branch_delta += sign * branch_tokens(body);
     }
-
     touched
-        .into_iter()
-        .map(|(def, signals)| SymbolSignals {
-            name: defs[def].name.clone(),
-            ident: defs[def].ident.clone(),
-            signals,
-        })
-        .collect()
 }
 
 /// Rough count of branch tokens on a changed line (a fact, not a measure). Matched with
@@ -359,10 +411,30 @@ mod tests {
         ));
     }
 
-    fn attribute(source: &str, path: &str, file: &ChangedFile) -> Vec<(String, i32)> {
-        attribute_signals(&find_symbol_defs(path, source).defs, file)
+    fn added(line: usize, body: &str) -> ChangedLine {
+        ChangedLine::Added {
+            line,
+            body: body.into(),
+        }
+    }
+
+    fn removed(line: usize, body: &str) -> ChangedLine {
+        ChangedLine::Removed {
+            line,
+            body: body.into(),
+        }
+    }
+
+    fn attribute(
+        path: &str,
+        old: &str,
+        new: &str,
+        lines: &[ChangedLine],
+    ) -> Vec<(String, i32, Option<Status>)> {
+        let defs = |src: &str| find_symbol_defs(path, src).defs;
+        attribute_signals(&defs(old), &defs(new), lines)
             .into_iter()
-            .map(|s| (s.name, s.signals.branch_delta))
+            .map(|s| (s.name, s.signals.branch_delta, s.signals.status))
             .collect()
     }
 
@@ -370,7 +442,7 @@ mod tests {
     // component. The handler is nested in it, so it is not a symbol of its own either.
     #[test]
     fn change_in_component_attributes_to_the_component_not_a_handler() {
-        let source = "\
+        let new = "\
 const Component = () => {
   const handleClick = () => {
     if (something) {}
@@ -381,44 +453,30 @@ const Component = () => {
   )
 }
 ";
-        let file = ChangedFile {
-            path: "c.tsx".into(),
-            new_blob: None,
-            changed_bodies: vec![
-                (3, 1, "    if (something) {}".into()),
-                (7, 1, "    condition && <Child />".into()),
-            ],
-        };
-        let out = attribute(source, "c.tsx", &file);
-        assert_eq!(out, vec![("Component".to_string(), 2)]);
+        let old = "const Component = () => {\n  return null\n}\n";
+        let lines = [
+            added(3, "    if (something) {}"),
+            added(7, "    condition && <Child />"),
+        ];
+        let out = attribute("c.tsx", old, new, &lines);
+        assert_eq!(out, vec![("Component".to_string(), 2, None)]);
     }
 
-    // A removed branch token subtracts: swapping `if true {}` for `if false {}` is net zero,
-    // not +2. Additions and removals must carry opposite signs.
+    // A removed branch token subtracts: swapping `if x {}` for `if y {}` is net zero, not +2.
     #[test]
     fn removed_branch_tokens_subtract() {
-        let source = "\
-fn foo() {
-    if x {}
-}
-";
-        let file = ChangedFile {
-            path: "x.rs".into(),
-            new_blob: None,
-            changed_bodies: vec![
-                (2, 1, "    if y {}".into()),  // added branch
-                (2, -1, "    if x {}".into()), // removed branch
-            ],
-        };
-        let out = attribute(source, "x.rs", &file);
-        assert_eq!(out, vec![("foo".to_string(), 0)]);
+        let old = "fn foo() {\n    if x {}\n}\n";
+        let new = "fn foo() {\n    if y {}\n}\n";
+        let lines = [removed(2, "    if x {}"), added(2, "    if y {}")];
+        let out = attribute("x.rs", old, new, &lines);
+        assert_eq!(out, vec![("foo".to_string(), 0, None)]);
     }
 
     // A `}` inside a string used to close `alpha` early under brace counting, dropping the
     // change below it.
     #[test]
     fn brace_in_string_does_not_end_the_symbol() {
-        let source = "\
+        let new = "\
 fn alpha() {
     let s = \"}\";
     if p && q {}
@@ -427,45 +485,58 @@ fn beta() {
     let x = 1;
 }
 ";
-        let file = ChangedFile {
-            path: "a.rs".into(),
-            new_blob: None,
-            changed_bodies: vec![(3, 1, "    if p && q {}".into())],
-        };
-        let out = attribute(source, "a.rs", &file);
-        assert_eq!(out, vec![("alpha".to_string(), 2)]);
+        let old = new.replace("    if p && q {}\n", "");
+        let out = attribute("a.rs", &old, new, &[added(3, "    if p && q {}")]);
+        assert_eq!(out, vec![("alpha".to_string(), 2, None)]);
     }
 
-    // KNOWN DEFECT, pinned as current behavior — not endorsed. A symbol deleted above `bar` has no
-    // new-side line, so its removed lines attribute to the next new-side line — inside the
-    // *unchanged* `bar`, which then shows a false `branch-1` while the deleted symbol shows nothing.
+    // Removed lines are placed on the old side. Placed by their new-side position instead,
+    // a deleted `foo` vanished and its lines landed on the unchanged `bar` below it.
     #[test]
-    fn pure_deletion_bleeds_onto_unchanged_following_symbol() {
-        // New side: `fn foo` (which had `if y`) has been deleted; `bar` is untouched.
-        let source = "\
-fn bar() {
-    let x = 1;
-}
-";
-        // The three removed lines of `foo` all attribute to new_line 1 (start of `bar`).
-        let file = ChangedFile {
-            path: "b.rs".into(),
-            new_blob: None,
-            changed_bodies: vec![
-                (1, -1, "fn foo() {".into()),
-                (1, -1, "    if y {}".into()),
-                (1, -1, "}".into()),
-            ],
-        };
-        let out = attribute(source, "b.rs", &file);
-        assert_eq!(out, vec![("bar".to_string(), -1)]); // DEFECT: bar was not changed
+    fn a_deleted_function_is_shown_deleted_and_its_neighbor_untouched() {
+        let old = "fn foo() {\n    if y {}\n}\nfn bar() {\n    let x = 1;\n}\n";
+        let new = "fn bar() {\n    let x = 1;\n}\n";
+        let lines = [
+            removed(1, "fn foo() {"),
+            removed(2, "    if y {}"),
+            removed(3, "}"),
+        ];
+        let out = attribute("b.rs", old, new, &lines);
+        assert_eq!(out, vec![("foo".to_string(), -1, Some(Status::Deleted))]);
+    }
+
+    // Matched by name: moving a function within the file is one edited row, and a rename is a
+    // deleted row plus a new one (no rename is inferred).
+    #[test]
+    fn symbols_match_across_sides_by_name() {
+        let old = "fn a() {}\nfn b() {\n    if x {}\n}\nfn gone() {}\n";
+        let new = "fn b() {\n    if x {}\n}\nfn a() {}\nfn renamed() {}\n";
+        let lines = [
+            added(1, "fn b() {"),
+            added(2, "    if x {}"),
+            added(3, "}"),
+            removed(2, "fn b() {"),
+            removed(3, "    if x {}"),
+            removed(4, "}"),
+            removed(5, "fn gone() {}"),
+            added(5, "fn renamed() {}"),
+        ];
+        let out = attribute("m.rs", old, new, &lines);
+        assert_eq!(
+            out,
+            vec![
+                ("b".to_string(), 0, None),
+                ("gone".to_string(), 0, Some(Status::Deleted)),
+                ("renamed".to_string(), 0, Some(Status::New)),
+            ]
+        );
     }
 
     // Same-named defs in one file (`new` in two impls) are separate symbols; each keeps its own
     // signals instead of being summed under one name, and its owner tells them apart.
     #[test]
     fn same_name_defs_stay_separate_rows() {
-        let source = "\
+        let new = "\
 impl A {
     fn new() {
         if a {}
@@ -477,18 +548,18 @@ impl B {
     }
 }
 ";
-        let file = ChangedFile {
-            path: "n.rs".into(),
-            new_blob: None,
-            changed_bodies: vec![
-                (3, 1, "        if a {}".into()),
-                (8, 1, "        if b && c {}".into()),
-            ],
-        };
-        let out = attribute(source, "n.rs", &file);
+        let old = "impl A {\n    fn new() {}\n}\nimpl B {\n    fn new() {}\n}\n";
+        let lines = [
+            added(3, "        if a {}"),
+            added(8, "        if b && c {}"),
+        ];
+        let out = attribute("n.rs", old, new, &lines);
         assert_eq!(
             out,
-            vec![("A::new".to_string(), 1), ("B::new".to_string(), 2)]
+            vec![
+                ("A::new".to_string(), 1, None),
+                ("B::new".to_string(), 2, None)
+            ]
         );
     }
 
@@ -502,23 +573,25 @@ impl B {
     fn render_joins_present_signals_only() {
         let bare = Signals {
             refs: Some(3),
-            branch_delta: 0,
+            ..Signals::default()
         };
         assert_eq!(bare.render(), "refs=3");
         let pos = Signals {
             refs: Some(3),
             branch_delta: 2,
+            ..Signals::default()
         };
         assert_eq!(pos.render(), "refs=3, branch+2");
         let neg = Signals {
             refs: Some(1),
             branch_delta: -1,
+            status: Some(Status::Deleted),
         };
-        assert_eq!(neg.render(), "refs=1, branch-1");
+        assert_eq!(neg.render(), "refs=1, branch-1, deleted");
         let unmeasured = Signals {
-            refs: None,
-            branch_delta: 0,
+            status: Some(Status::New),
+            ..Signals::default()
         };
-        assert_eq!(unmeasured.render(), "refs=?");
+        assert_eq!(unmeasured.render(), "refs=?, new");
     }
 }

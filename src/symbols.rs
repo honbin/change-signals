@@ -33,20 +33,11 @@ pub(crate) struct SymbolDefs {
 /// enclosing function. Listing inner ones mislabels changes with local names that a reader
 /// can't locate; the cost is that a component's handlers no longer show separately.
 pub(crate) fn find_symbol_defs(path: &str, source: &str) -> SymbolDefs {
-    let (language, lang): (Language, Lang) = match path.rsplit_once('.').map(|(_, ext)| ext) {
-        Some("rs") => (tree_sitter_rust::LANGUAGE.into(), Lang::Rust),
-        Some("ts" | "mts" | "cts") => {
-            (tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(), Lang::Ts)
-        }
-        Some("tsx" | "js" | "jsx" | "mjs" | "cjs") => {
-            (tree_sitter_typescript::LANGUAGE_TSX.into(), Lang::Ts)
-        }
-        _ => {
-            return SymbolDefs {
-                defs: Vec::new(),
-                has_errors: false,
-            };
-        }
+    let Some((language, lang)) = grammar_for(path) else {
+        return SymbolDefs {
+            defs: Vec::new(),
+            has_errors: false,
+        };
     };
     let mut parser = Parser::new();
     parser
@@ -62,6 +53,24 @@ pub(crate) fn find_symbol_defs(path: &str, source: &str) -> SymbolDefs {
         defs,
         has_errors: tree.root_node().has_error(),
     }
+}
+
+/// Whether `find_symbol_defs` can find anything in `path`, so callers can skip reading files
+/// it would discard.
+pub(crate) fn is_supported(path: &str) -> bool {
+    grammar_for(path).is_some()
+}
+
+fn grammar_for(path: &str) -> Option<(Language, Lang)> {
+    let grammar = match path.rsplit_once('.').map(|(_, ext)| ext)? {
+        "rs" => (tree_sitter_rust::LANGUAGE.into(), Lang::Rust),
+        "ts" | "mts" | "cts" => (tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(), Lang::Ts),
+        "tsx" | "js" | "jsx" | "mjs" | "cjs" => {
+            (tree_sitter_typescript::LANGUAGE_TSX.into(), Lang::Ts)
+        }
+        _ => return None,
+    };
+    Some(grammar)
 }
 
 #[derive(Clone, Copy)]

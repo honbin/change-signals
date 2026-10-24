@@ -49,6 +49,7 @@ chsig                # no args = working diff
 src/cache/store.ts
   getOrFetch                   refs=14, branch+5
   evictExpired                 refs=6, branch+1
+  pruneStale                   refs=0, branch-2, deleted
 
 src/db/records.ts
   loadRecord                   refs=12
@@ -85,12 +86,14 @@ tool picks where to look, not what to conclude.
 - Changes outside every symbol are not shown: types, imports, module-level statements,
   doc comments and attributes above a function, and code only inside anonymous callbacks
   (most of a `describe`/`it` test file).
-- A wholly deleted symbol is not shown, and its removed lines can attribute to the next,
-  unchanged symbol.
+- Added lines are placed on the new side's symbols and removed lines on the old side's.
+  Symbols are matched across the two sides by name; one whose name exists on only one side
+  is marked `new` or `deleted`, so a rename shows as one of each (no rename is inferred).
 - When the parser hits syntax it can't read, chsig warns `parse errors in <file>; symbol
-  ranges may be off` on stderr. The TypeScript grammar does not read `import('...')` types
-  inside type arguments (e.g. `importOriginal<typeof import('x')>()`), nor call signatures
-  in an interface or type literal separated only by newlines.
+  ranges may be off` on stderr (`<file> (old side)` for the old side). The TypeScript
+  grammar does not read `import('...')` types inside type arguments (e.g.
+  `importOriginal<typeof import('x')>()`), nor call signatures in an interface or type
+  literal separated only by newlines.
 - `refs` is `git grep`-based (tracked files across the whole repo, as in the working tree),
   matching the bare name, not resolved references.
 - `branch` is a crude substring count of branch tokens (`if`, `&&`, `?.`, ...) on changed
