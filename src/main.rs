@@ -277,7 +277,6 @@ fn collect_symbols(root: &str, file: &ChangedFile, side: SourceSide) -> Vec<Symb
     let new = match &file.new {
         None => SymbolDefs::default(),
         Some(new) => {
-            // deleted in the worktree, binary, or unreadable
             let Some(source) = read_new_side(root, new, side) else {
                 return Vec::new();
             };
@@ -344,10 +343,20 @@ fn source_side(args: &[String]) -> SourceSide {
 }
 
 /// Read the new side from the chosen source — no fallback between them. On failure the file
-/// is skipped: a missing fact beats a plausible one read from the wrong source.
+/// is skipped with a notice: a missing fact beats a plausible one read from the wrong source.
+/// Invalid UTF-8 is replaced, as for a blob, since it doesn't move line breaks.
 fn read_new_side(root: &str, new: &Side, side: SourceSide) -> Option<String> {
     match side {
-        SourceSide::Worktree => std::fs::read_to_string(format!("{root}/{}", new.path)).ok(),
+        SourceSide::Worktree => match std::fs::read(format!("{root}/{}", new.path)) {
+            Ok(bytes) => Some(String::from_utf8_lossy(&bytes).into_owned()),
+            Err(e) => {
+                eprintln!(
+                    "chsig: could not read {} from the working tree ({e}); skipping",
+                    new.path
+                );
+                None
+            }
+        },
         SourceSide::Blob => read_blob(new, "new"),
     }
 }

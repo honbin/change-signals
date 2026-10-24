@@ -366,3 +366,25 @@ fn changed_calls_follow_the_symbol_row() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// A working file that isn't valid UTF-8 is still read, as a blob would be, rather than
+// silently dropped.
+#[test]
+fn a_non_utf8_working_file_is_read() {
+    let dir = temp_repo("non-utf8");
+    std::fs::write(dir.join("a.rs"), "fn alpha() {\n    x();\n}\n").unwrap();
+    git(&dir, &["add", "a.rs"]);
+    git(&dir, &["commit", "-qm", "init"]);
+    std::fs::write(
+        dir.join("a.rs"),
+        b"fn alpha() {\n    x();\n    y(); // \xff\n}\n",
+    )
+    .unwrap();
+    let (out, err) = chsig_full(&dir, &[]);
+    assert_eq!(
+        out,
+        "a.rs\n  alpha                        refs=1\n      calls: +y\n\n"
+    );
+    assert_eq!(err, "");
+    let _ = std::fs::remove_dir_all(&dir);
+}
