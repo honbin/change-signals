@@ -611,6 +611,7 @@ function parse(a: any) {
     fn render_lines_names_the_first_three() {
         assert_eq!(render_lines(&[12]), "line 12");
         assert_eq!(render_lines(&[12, 40]), "lines 12, 40");
+        assert_eq!(render_lines(&[1, 2, 3]), "lines 1, 2, 3");
         assert_eq!(render_lines(&[1, 2, 3, 4]), "lines 1, 2, 3, …");
     }
 

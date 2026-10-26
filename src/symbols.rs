@@ -643,6 +643,7 @@ this.client.request(p);
 sql`SELECT 1`;
 new Date();
 fns[0]();
+cache.get<string>(k);
 ";
         assert_eq!(
             calls("a.ts", src),
@@ -661,6 +662,7 @@ fns[0]();
                 "*.run",
                 "sql",
                 "new Date",
+                "cache.get",
             ]
         );
     }
@@ -679,6 +681,7 @@ fn f() {
     (a + b).abs();
     (!s.is_empty()).then(f);
     n.parse::<u64>().ok();
+    Self::CACHE.clear();
 }
 ";
         assert_eq!(
@@ -697,7 +700,15 @@ fn f() {
                 "s.is_empty",
                 "n.ok",
                 "n.parse",
+                "CACHE.clear",
             ]
+        );
+        // Only that a path call as receiver gets a name: which name (`read` or `fs::read`) is
+        // not settled yet.
+        let path_call = calls("a.rs", "fn f() {\n    fs::read(p).unwrap();\n}\n");
+        assert!(
+            !path_call.iter().any(|c| c.starts_with("*.")),
+            "{path_call:?}"
         );
     }
 
@@ -722,7 +733,10 @@ async function load() {
             vec!["env.get", "client.query", "req.catch", "req.json", "run"]
         );
         assert_eq!(names("a.ts", src), vec!["load"]);
-        let top = "export const res = await run<Out>(() => 1);\n";
+        let top = "\
+export const res = await run<Out>(() => 1);
+export const body = await req.json<Body>().catch(() => null);
+";
         assert!(names("a.ts", top).is_empty());
     }
 
