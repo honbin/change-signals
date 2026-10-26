@@ -549,6 +549,36 @@ impl B {
         );
     }
 
+    #[test]
+    fn overloads_share_one_row() {
+        let old = "\
+function parse(a: string): number;
+function parse(a: number): number;
+function parse(a: any) {
+  return 0;
+}
+";
+        let new = "\
+function parse(a: string): number;
+function parse(a: boolean): number;
+function parse(a: any) {
+  if (a) {}
+  return 0;
+}
+";
+        let lines = [Removed(2), Added(2), Added(4)];
+        let out = attribute("p.ts", old, new, &lines);
+        assert_eq!(out, vec![("parse".to_string(), 1, None)]);
+    }
+
+    #[test]
+    fn a_line_shared_by_two_defs_goes_to_the_later_one() {
+        let old = "fn a() {} fn b() {}\n";
+        let new = "fn a() {} fn b() { if x {} }\n";
+        let out = attribute("s.rs", old, new, &[Removed(1), Added(1)]);
+        assert_eq!(out, vec![("b".to_string(), 1, None)]);
+    }
+
     // A call kept across an edit is bare; one only added or only removed carries its side.
     #[test]
     fn calls_carry_the_side_they_were_changed_on() {
