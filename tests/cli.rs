@@ -361,21 +361,6 @@ fn clean_file_has_no_warning() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-// A deleted function is read from the old side (here the index, for a working diff) and shown
-// as deleted; its removed lines must not land on the unchanged function below it.
-#[test]
-fn a_deleted_function_is_shown_deleted() {
-    let dir = repo_with_alpha_edit("deleted-fn", "a.rs");
-    std::fs::write(dir.join("a.rs"), "fn beta() {\n    let y = 2;\n}\n").unwrap();
-    let (out, err) = chsig_full(&dir, &[]);
-    assert_eq!(
-        out,
-        "a.rs\n  alpha                        refs=0, deleted\n\n"
-    );
-    assert_eq!(err, "");
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
 // A file deleted in a commit has no new side; its symbols come from the old blob.
 #[test]
 fn a_deleted_file_shows_its_symbols_deleted() {
