@@ -102,7 +102,9 @@ tool picks where to look, not what to conclude.
   symbol ranges may be off` on stderr, naming up to three lines where it went wrong
   (`<file> (old side)` for the old side). The TypeScript grammar does not read
   `import('...')` types inside type arguments (e.g. `importOriginal<typeof import('x')>()`),
-  nor call signatures in an interface or type literal separated only by newlines.
+  nor call signatures in an interface or type literal separated only by newlines, nor a `&`
+  before a letter in JSX text or an attribute string unless it closes as `&name;`
+  (`href="?a=1&b=2"` warns; `&amp;` doesn't).
 - Pass revisions and paths. An option that changes the diff's format (`--color`,
   `--word-diff`, `--stat`, `-R`) is refused with an error, since chsig reads the plain patch.
   A combined diff (a merge, `<merge>^!`, or a conflicted file) is skipped with a notice;
