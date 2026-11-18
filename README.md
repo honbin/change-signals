@@ -86,7 +86,8 @@ tool picks where to look, not what to conclude.
 - Symbols are found for Rust and TypeScript/JavaScript only; other files are skipped.
 - A symbol is the outermost named function or method: free functions, methods of an
   `impl`/trait/class/object literal (shown as `Foo::new`, `Client.fetch`), variables
-  bound to a function or to a call handed one (`memo(() => ...)`), and an anonymous
+  bound to a function or, outside an anonymous function, to a call handed one
+  (`memo(() => ...)`; inside one, `const ids = xs.map(f)` is a local value), and an anonymous
   `export default` of either (shown as `default`, with `refs=?` since it has no name to
   grep for). A named function inside another one is not a symbol of its own — a
   component's handlers attribute to the component.

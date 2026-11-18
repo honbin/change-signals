@@ -51,7 +51,7 @@ pub(crate) fn find_symbol_defs(path: &str, source: &str) -> SymbolDefs {
         .parse(source, None)
         .expect("parse without a timeout or cancellation returns a tree");
     let mut defs = Vec::new();
-    collect_defs(tree.root_node(), source, lang, None, &mut defs);
+    collect_defs(tree.root_node(), source, lang, None, false, &mut defs);
     // A def's span starts at its decorators, so a function in their arguments
     // (`@UseInterceptors(X({ destination: () => … }))`) lands inside it; it folds into the
     // def like any nested function.
@@ -176,13 +176,22 @@ impl Lang {
 }
 
 /// Walk `node`, recording each named function and not descending into it. `owner` is the
-/// name of the nearest enclosing impl, trait, class, or bound object literal.
-fn collect_defs(node: Node, src: &str, lang: Lang, owner: Option<&str>, out: &mut Vec<SymbolDef>) {
+/// name of the nearest enclosing impl, trait, class, or bound object literal. `in_fn` is set
+/// once the walk enters a function; since it never enters a def, that function is anonymous
+/// (an `it(() => ...)` body, a route handler).
+fn collect_defs(
+    node: Node,
+    src: &str,
+    lang: Lang,
+    owner: Option<&str>,
+    in_fn: bool,
+    out: &mut Vec<SymbolDef>,
+) {
     let qualify = |name: &str| match owner {
         Some(o) => format!("{o}{}{name}", lang.owner_sep()),
         None => name.to_string(),
     };
-    if let Some(def) = def_name(node, src, lang) {
+    if let Some(def) = def_name(node, src, lang, in_fn) {
         let ident = match def {
             DefName::Ident(i) => Some(i),
             DefName::AnonymousDefault => None,
@@ -205,13 +214,14 @@ fn collect_defs(node: Node, src: &str, lang: Lang, owner: Option<&str>, out: &mu
         .filter(|_| node.kind() == "export_statement")
         .and_then(|d| owner_name(d, src, lang))
         .map(|o| qualify(&o));
+    let in_fn = in_fn || is_function_value(node);
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         let owner = match child.kind() {
             "decorator" => decorated.as_deref().or(owner),
             _ => owner,
         };
-        collect_defs(child, src, lang, owner, out);
+        collect_defs(child, src, lang, owner, in_fn, out);
     }
 }
 
@@ -246,9 +256,19 @@ enum DefName {
     AnonymousDefault,
 }
 
-fn def_name(node: Node, src: &str, lang: Lang) -> Option<DefName> {
+/// Inside an anonymous function only a function value names a def: there a call handed one
+/// is nearly always a local value (`xs.map(f)` in a test, `rows.find(f)` in a handler), and
+/// telling it from `memo(f)` by the callee's name would need a vocabulary chsig doesn't keep.
+fn def_name(node: Node, src: &str, lang: Lang, in_fn: bool) -> Option<DefName> {
     let field_text = |field: &str| node.child_by_field_name(field).map(|n| key_text(n, src));
-    let value_binds_function = || binds_function(node.child_by_field_name("value"));
+    let value_binds_function = || {
+        let value = node.child_by_field_name("value");
+        if in_fn {
+            value.is_some_and(is_function_value)
+        } else {
+            binds_function(value)
+        }
+    };
     let ident = match (lang, node.kind()) {
         (Lang::Rust, "function_item" | "function_signature_item") => field_text("name"),
         (
@@ -420,20 +440,22 @@ fn last_segment<'s>(n: Node, src: &'s str) -> &'s str {
     }
 }
 
+/// A function written as a value: an arrow, a `function` expression, or a generator one.
+fn is_function_value(n: Node) -> bool {
+    matches!(
+        n.kind(),
+        "arrow_function" | "function_expression" | "generator_function"
+    )
+}
+
 /// Whether a binding's value is a function, or a call handed a function (`memo(() => ...)`,
 /// `useCallback(...)`), which is named only by the binding. A call without one
 /// (`useQuery({...})`) is a value, not a symbol.
 fn binds_function(value: Option<Node>) -> bool {
-    let is_fn = |n: Node| {
-        matches!(
-            n.kind(),
-            "arrow_function" | "function_expression" | "generator_function"
-        )
-    };
     let Some(value) = value else {
         return false;
     };
-    if is_fn(value) {
+    if is_function_value(value) {
         return true;
     }
     if awaits_whole_chain(value) {
@@ -446,7 +468,7 @@ fn binds_function(value: Option<Node>) -> bool {
         return false;
     };
     let mut cursor = args.walk();
-    args.named_children(&mut cursor).any(is_fn)
+    args.named_children(&mut cursor).any(is_function_value)
 }
 
 /// Whether a misread `await` (see `misread_await`) heads the call chain of `value`. The source's
@@ -921,5 +943,22 @@ describe('x', () => {
                 "default",
             ]
         );
+    }
+
+    #[test]
+    fn inside_an_anonymous_function_only_function_values_are_symbols() {
+        let src = "\
+const h = defineHandler((req) => req);
+it('y', () => {
+  const ids = xs.map((x) => x.id);
+  const mock = vi.fn(() => 1);
+  const helper = () => {};
+});
+app.get('/', async (c) => {
+  const row = rows.find((r) => r.id === c.id);
+  function load() {}
+});
+";
+        assert_eq!(names("x.ts", src), vec!["h", "helper", "load"]);
     }
 }
