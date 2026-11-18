@@ -361,6 +361,26 @@ fn clean_file_has_no_warning() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// refs greps the working tree, so a range read while another revision is checked out says so.
+#[test]
+fn a_range_not_checked_out_is_noted_for_refs() {
+    let dir = repo_with_alpha_edit("range-refs", "a.rs");
+    git(&dir, &["commit", "-qam", "alpha"]);
+    git(&dir, &["tag", "new"]);
+    let (at_new, quiet) = chsig_full(&dir, &["new^!"]);
+    assert_eq!(quiet, "");
+
+    git(&dir, &["checkout", "-q", "new^"]);
+    let (at_base, noted) = chsig_full(&dir, &["new^!"]);
+    assert_eq!(at_base, at_new);
+    assert_eq!(
+        noted,
+        "chsig: refs counts the working tree, but 1 of 1 changed files there are not the \
+         diff's new side; run from a checkout of the new side for refs that match\n"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // A file deleted in a commit has no new side; its symbols come from the old blob.
 #[test]
 fn a_deleted_file_shows_its_symbols_deleted() {

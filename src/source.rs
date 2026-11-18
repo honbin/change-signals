@@ -63,18 +63,30 @@ pub(crate) fn read_new_side(root: &str, new: &Side, side: SourceSide) -> Option<
 /// the bytes hashed, with git's filters for the path applied as they were for the diff's blob,
 /// so a save in between can't slip unchecked content into the parse.
 fn read_working_file(root: &str, new: &Side) -> Option<String> {
-    let skip = |why: &str| {
-        eprintln!("chsig: {} in the working tree {why}; skipping", new.path);
-        None
-    };
-    let bytes = match std::fs::read(format!("{root}/{}", new.path)) {
-        Ok(bytes) => bytes,
-        Err(e) => return skip(&format!("could not be read ({e})")),
-    };
+    match working_new_side(root, new) {
+        Ok(bytes) => Some(String::from_utf8_lossy(&bytes).into_owned()),
+        Err(why) => {
+            eprintln!("chsig: {} in the working tree {why}; skipping", new.path);
+            None
+        }
+    }
+}
+
+/// Whether the working tree holds the diff's new side of this file. When that side is read
+/// from a blob, `refs` still greps the working tree, so a checkout elsewhere (the base of a
+/// PR, say) counts a different revision: a new symbol used across the diff shows `refs=0`.
+pub(crate) fn worktree_holds(root: &str, new: &Side) -> bool {
+    working_new_side(root, new).is_ok()
+}
+
+/// The working file's bytes if they are the diff's new side, otherwise why not.
+fn working_new_side(root: &str, new: &Side) -> Result<Vec<u8>, String> {
+    let bytes = std::fs::read(format!("{root}/{}", new.path))
+        .map_err(|e| format!("could not be read ({e})"))?;
     match hash_with_filters(root, &new.path, &bytes) {
-        None => skip("could not be hashed"),
-        Some(sha) if !sha.starts_with(&new.blob) => skip("is not the diff's new side"),
-        Some(_) => Some(String::from_utf8_lossy(&bytes).into_owned()),
+        None => Err("could not be hashed".to_string()),
+        Some(sha) if !sha.starts_with(&new.blob) => Err("is not the diff's new side".to_string()),
+        Some(_) => Ok(bytes),
     }
 }
 

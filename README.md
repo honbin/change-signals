@@ -111,7 +111,10 @@ tool picks where to look, not what to conclude.
   otherwise it is skipped with a notice, as for a retargeted symlink. A filter that swaps the
   whole content, such as Git LFS, still passes the check while the diff describes the pointer.
 - `refs` is `git grep`-based (tracked files across the whole repo, as in the working tree),
-  matching the bare name, not resolved references.
+  matching the bare name, not resolved references. With a range or `--cached`, chsig says on
+  stderr when changed files in the working tree are not the diff's new side (a PR reviewed
+  from its base checkout, say), since refs then counts another revision; run from a checkout
+  of the new side (a worktree of the PR's head) for refs that match the diff.
 - `calls` resolves nothing. A receiver with no name to show (`(a + b).abs()`, a literal) is
   `*`, and a call through an expression (`fns[i]()`) is not listed. Nor is a TypeScript
   tagged template with type arguments (``sql<Row>`...` ``): the grammar misreads it, often

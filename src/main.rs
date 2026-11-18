@@ -11,7 +11,7 @@ use std::io::{self, Write};
 use std::process::Command;
 
 use diff::{ChangedFile, ChangedLine, ParsedDiff, Side, Skipped, Unreadable, parse_diff};
-use source::{SourceSide, read_new_side, read_old_side, source_side};
+use source::{SourceSide, read_new_side, read_old_side, source_side, worktree_holds};
 use symbols::{SymbolDef, SymbolDefs, find_symbol_defs};
 
 mod diff;
@@ -58,6 +58,20 @@ fn main() {
                 "chsig: skipping {path}: a combined diff (merge or conflict) is not read; \
                  diff against one parent, as in `<merge>^1 <merge>` or `HEAD`"
             ),
+        }
+    }
+    if matches!(side, SourceSide::Blob) {
+        let new_sides: Vec<&Side> = files.iter().filter_map(|f| f.new.as_ref()).collect();
+        let elsewhere = new_sides
+            .iter()
+            .filter(|n| !worktree_holds(&root, n))
+            .count();
+        if elsewhere > 0 {
+            eprintln!(
+                "chsig: refs counts the working tree, but {elsewhere} of {} changed files there \
+                 are not the diff's new side; run from a checkout of the new side for refs that match",
+                new_sides.len()
+            );
         }
     }
     // Handle write errors explicitly: BrokenPipe is expected when the reader exits early.
